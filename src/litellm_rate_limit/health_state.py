@@ -5,6 +5,10 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from litellm_rate_limit.provider_probe import ProviderProbeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +30,21 @@ class HealthStateManager:
 
     Tracks which models are rate-limited and when they should be restored.
     Uses monotonic time for reliable duration tracking.
+
+    When provider_probe_config is set, uses probe model health status
+    for models under the same provider that are not explicitly listed.
     """
 
+    provider_probe_config: "ProviderProbeConfig | None" = None
     _rate_limited_until: dict[str, float] = field(default_factory=dict)
     _rate_limit_reset_at: dict[str, datetime] = field(default_factory=dict)
     _model_status: dict[str, ModelHealthStatus] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def _get_effective_model(self, model_id: str) -> str:
+        if self.provider_probe_config is None:
+            return model_id
+        return self.provider_probe_config.get_effective_model(model_id)
 
     async def mark_rate_limited(
         self,
@@ -39,20 +52,21 @@ class HealthStateManager:
         seconds_until_reset: float,
         reset_at: datetime | None = None,
     ) -> None:
+        effective_model = self._get_effective_model(model_id)
         until_monotonic = time.monotonic() + seconds_until_reset
 
         async with self._lock:
-            self._rate_limited_until[model_id] = until_monotonic
+            self._rate_limited_until[effective_model] = until_monotonic
             if reset_at:
-                self._rate_limit_reset_at[model_id] = reset_at
+                self._rate_limit_reset_at[effective_model] = reset_at
 
-            if model_id in self._model_status:
-                self._model_status[model_id].is_rate_limited = True
-                self._model_status[model_id].rate_limited_until = until_monotonic
-                self._model_status[model_id].rate_limit_reset_at = reset_at
+            if effective_model in self._model_status:
+                self._model_status[effective_model].is_rate_limited = True
+                self._model_status[effective_model].rate_limited_until = until_monotonic
+                self._model_status[effective_model].rate_limit_reset_at = reset_at
             else:
-                self._model_status[model_id] = ModelHealthStatus(
-                    model_id=model_id,
+                self._model_status[effective_model] = ModelHealthStatus(
+                    model_id=effective_model,
                     is_rate_limited=True,
                     rate_limited_until=until_monotonic,
                     rate_limit_reset_at=reset_at,
@@ -60,26 +74,28 @@ class HealthStateManager:
 
         logger.info(
             "Model %s marked as rate-limited for %.1f seconds (resets at %s)",
-            model_id,
+            effective_model,
             seconds_until_reset,
             reset_at or "unknown",
         )
 
     async def is_rate_limited(self, model_id: str) -> bool:
+        effective_model = self._get_effective_model(model_id)
+
         async with self._lock:
-            if model_id not in self._rate_limited_until:
+            if effective_model not in self._rate_limited_until:
                 return False
 
-            if time.monotonic() >= self._rate_limited_until[model_id]:
-                del self._rate_limited_until[model_id]
-                self._rate_limit_reset_at.pop(model_id, None)
+            if time.monotonic() >= self._rate_limited_until[effective_model]:
+                del self._rate_limited_until[effective_model]
+                self._rate_limit_reset_at.pop(effective_model, None)
 
-                if model_id in self._model_status:
-                    self._model_status[model_id].is_rate_limited = False
-                    self._model_status[model_id].rate_limited_until = None
-                    self._model_status[model_id].rate_limit_reset_at = None
+                if effective_model in self._model_status:
+                    self._model_status[effective_model].is_rate_limited = False
+                    self._model_status[effective_model].rate_limited_until = None
+                    self._model_status[effective_model].rate_limit_reset_at = None
 
-                logger.info("Model %s automatically restored after rate limit expiry", model_id)
+                logger.info("Model %s automatically restored after rate limit expiry", effective_model)
                 return False
 
             return True
@@ -109,47 +125,54 @@ class HealthStateManager:
         return result
 
     async def clear_rate_limit(self, model_id: str) -> bool:
+        effective_model = self._get_effective_model(model_id)
+
         async with self._lock:
-            if model_id in self._rate_limited_until:
-                del self._rate_limited_until[model_id]
-                self._rate_limit_reset_at.pop(model_id, None)
+            if effective_model in self._rate_limited_until:
+                del self._rate_limited_until[effective_model]
+                self._rate_limit_reset_at.pop(effective_model, None)
 
-                if model_id in self._model_status:
-                    self._model_status[model_id].is_rate_limited = False
-                    self._model_status[model_id].rate_limited_until = None
-                    self._model_status[model_id].rate_limit_reset_at = None
+                if effective_model in self._model_status:
+                    self._model_status[effective_model].is_rate_limited = False
+                    self._model_status[effective_model].rate_limited_until = None
+                    self._model_status[effective_model].rate_limit_reset_at = None
 
-                logger.info("Manually cleared rate limit for model %s", model_id)
+                logger.info("Manually cleared rate limit for model %s", effective_model)
                 return True
             return False
 
     async def get_model_status(self, model_id: str) -> ModelHealthStatus | None:
-        await self.is_rate_limited(model_id)
+        effective_model = self._get_effective_model(model_id)
+        await self.is_rate_limited(effective_model)
 
         async with self._lock:
-            return self._model_status.get(model_id)
+            return self._model_status.get(effective_model)
 
     async def record_failure(self, model_id: str, error: str) -> None:
+        effective_model = self._get_effective_model(model_id)
+
         async with self._lock:
-            if model_id in self._model_status:
-                self._model_status[model_id].consecutive_failures += 1
-                self._model_status[model_id].last_error = error
+            if effective_model in self._model_status:
+                self._model_status[effective_model].consecutive_failures += 1
+                self._model_status[effective_model].last_error = error
             else:
-                self._model_status[model_id] = ModelHealthStatus(
-                    model_id=model_id,
+                self._model_status[effective_model] = ModelHealthStatus(
+                    model_id=effective_model,
                     consecutive_failures=1,
                     last_error=error,
                 )
 
     async def record_success(self, model_id: str) -> None:
+        effective_model = self._get_effective_model(model_id)
+
         async with self._lock:
-            if model_id in self._model_status:
-                self._model_status[model_id].consecutive_failures = 0
-                self._model_status[model_id].last_error = None
-                self._model_status[model_id].last_check_time = time.monotonic()
+            if effective_model in self._model_status:
+                self._model_status[effective_model].consecutive_failures = 0
+                self._model_status[effective_model].last_error = None
+                self._model_status[effective_model].last_check_time = time.monotonic()
             else:
-                self._model_status[model_id] = ModelHealthStatus(
-                    model_id=model_id,
+                self._model_status[effective_model] = ModelHealthStatus(
+                    model_id=effective_model,
                     last_check_time=time.monotonic(),
                 )
 

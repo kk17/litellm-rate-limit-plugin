@@ -9,6 +9,7 @@ A plugin for LiteLLM Proxy that provides intelligent health checking and rate li
 - **Smart model blocking** - Temporarily remove rate-limited models from routing until reset
 - **Automatic restoring** - Unblock models when rate limit window expires
 - **Model aliases** - User-friendly alias config with rate limit integration
+- **Provider probe models** - Share health status across models from the same provider
 
 ## Installation
 
@@ -96,6 +97,63 @@ rate_limit_plugin:
     timeout_seconds: 30
 ```
 
+### Provider Probe Models
+
+Share health status across models from the same provider. Useful when multiple models
+share the same backend/API endpoint:
+
+```yaml
+rate_limit_plugin:
+  health_check:
+    # Specify probe models per provider
+    # The first model's health status is used for unlisted models with the same prefix
+    probe_models_by_provider:
+      minimax: ["minimax-m2"]
+      zai: ["glm-4.5-air", "glm-5"]
+      github-copilot: ["gemini-3-flash-preview", "gpt-4o", "gpt-4.1", "gpt-5-mini"]
+```
+
+**How it works:**
+
+| Config | Probe Model | Explicit Models | Behavior |
+|--------|-------------|-----------------|----------|
+| `minimax: ["minimax-m2"]` | `minimax-m2` | `minimax-m2` | ALL `minimax-*` models share `minimax-m2` health status |
+| `zai: ["glm-4.5-air", "glm-5"]` | `glm-4.5-air` | `glm-4.5-air`, `glm-5` | `glm-4.5-air` status used for unlisted `glm-*` models; `glm-5` has its own status |
+
+**Example:**
+
+```yaml
+probe_models_by_provider:
+  zai: ["glm-4.5-air", "glm-5"]
+```
+
+- `glm-4.5-air` is the probe model (first in list)
+- `glm-5` is explicitly listed, so it gets its own health status
+- `glm-4-plus`, `glm-3-turbo`, etc. (unlisted) will share `glm-4.5-air`'s health status
+
+**Programmatic Usage:**
+
+```python
+from litellm_rate_limit import HealthStateManager, ProviderProbeConfig
+
+# Configure probe models
+probe_config = ProviderProbeConfig(
+    probe_models_by_provider={
+        "minimax": ["minimax-m2"],
+        "zai": ["glm-4.5-air", "glm-5"],
+    }
+)
+
+# Create health manager with probe config
+health_state = HealthStateManager(provider_probe_config=probe_config)
+
+# Mark probe model as rate-limited
+await health_state.mark_rate_limited("minimax-m2", 60.0)
+
+# All minimax-* models are now blocked
+assert await health_state.is_rate_limited("minimax-abab6.5") is True
+```
+
 ### Programmatic Usage
 
 ```python
@@ -106,17 +164,26 @@ from litellm_rate_limit import (
     HealthCheckRunner,
     HealthBenchmark,
     AliasAwareHealthState,
+    ProviderProbeConfig,
 )
 
 async def main():
+    # Configure probe models for provider health sharing
+    probe_config = ProviderProbeConfig(
+        probe_models_by_provider={
+            "minimax": ["minimax-m2"],
+            "zai": ["glm-4.5-air", "glm-5"],
+        }
+    )
+
     # Create callback with custom settings
     callback = RateLimitCallback(default_cooldown_seconds=60.0)
 
     # Set the router reference for cooldown updates
     callback.set_router(litellm_router)
 
-    # Health state manager for tracking rate limits
-    health_state = HealthStateManager()
+    # Health state manager with probe config
+    health_state = HealthStateManager(provider_probe_config=probe_config)
 
     # Mark a model as rate-limited
     await health_state.mark_rate_limited(

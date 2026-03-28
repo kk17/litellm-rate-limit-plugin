@@ -7,6 +7,7 @@ Features:
 - Rate limit extraction from API headers (Anthropic, OpenAI)
 - Smart model blocking with automatic restoration
 - Model alias support with rate limit integration
+- Provider probe models for shared health status
 """
 
 from litellm_rate_limit.alias_aware_state import AliasAwareHealthState, RateLimitEntry
@@ -24,6 +25,7 @@ from litellm_rate_limit.parser import (
     extract_rate_limit_reset_seconds,
     is_rate_limit_error,
 )
+from litellm_rate_limit.provider_probe import ProviderProbeConfig
 
 __all__ = [
     "AliasAwareHealthState",
@@ -34,6 +36,7 @@ __all__ = [
     "HealthStateManager",
     "HealthStatus",
     "ModelHealthStatus",
+    "ProviderProbeConfig",
     "RateLimitCallback",
     "RateLimitEntry",
     "extract_rate_limit_reset_dt",
