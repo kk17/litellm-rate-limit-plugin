@@ -27,24 +27,172 @@ litellm_settings:
   callbacks: ["rate_limit_callback"]
 ```
 
+### Fallback Configuration
+
+Configure model fallbacks when rate limits are hit:
+
+```yaml
+model_list:
+  - model_name: gpt-4
+    litellm_params:
+      model: openai/gpt-4-turbo
+  - model_name: gpt-4
+    litellm_params:
+      model: openai/gpt-4
+  - model_name: claude-3
+    litellm_params:
+      model: anthropic/claude-3-opus-20240229
+  - model_name: claude-3
+    litellm_params:
+      model: anthropic/claude-3-sonnet-20240229
+
+router_settings:
+  # Enable fallback routing
+  num_retries: 3
+  retry_after: 5
+
+  # Fallback to other deployments of same model
+  fallbacks: [
+    {
+      "gpt-4": ["gpt-4", "claude-3"]
+    },
+    {
+      "claude-3": ["claude-3", "gpt-4"]
+    }
+  ]
+
+litellm_settings:
+  callbacks: ["rate_limit_callback"]
+```
+
+### Health Check Configuration
+
+Enable proactive health checking to detect issues before requests fail:
+
+```yaml
+litellm_settings:
+  callbacks: ["rate_limit_callback"]
+
+rate_limit_plugin:
+  # Default cooldown when no reset time in headers
+  default_cooldown_seconds: 60
+
+  # Header parsing configuration
+  header_parsing:
+    enabled: true
+    # Anthropic's unified reset header (Unix timestamp)
+    anthropic_reset_header: "anthropic-ratelimit-unified-reset"
+
+  # Health check configuration
+  health_check:
+    enabled: true
+    # How often to run health checks (seconds)
+    interval_seconds: 60
+    # Prompt to send for health checks
+    test_prompt: "Say 'ok'"
+    # Maximum acceptable latency (ms)
+    max_latency_ms: 30000
+    # Timeout for individual health checks (seconds)
+    timeout_seconds: 30
+```
+
 ### Programmatic Usage
 
 ```python
+import asyncio
 from litellm_rate_limit import (
     RateLimitCallback,
     HealthStateManager,
+    HealthCheckRunner,
+    HealthBenchmark,
     AliasAwareHealthState,
 )
 
-# Create callback with custom settings
-callback = RateLimitCallback(default_cooldown_seconds=60.0)
+async def main():
+    # Create callback with custom settings
+    callback = RateLimitCallback(default_cooldown_seconds=60.0)
 
-# Use health state manager
+    # Set the router reference for cooldown updates
+    callback.set_router(litellm_router)
+
+    # Health state manager for tracking rate limits
+    health_state = HealthStateManager()
+
+    # Mark a model as rate-limited
+    await health_state.mark_rate_limited(
+        model_id="anthropic/claude-3-opus",
+        seconds_until_reset=120.0,
+    )
+
+    # Check if model is rate-limited (auto-restores when expired)
+    if await health_state.is_rate_limited("anthropic/claude-3-opus"):
+        print("Model is rate-limited, use fallback")
+
+    # Get all healthy models from a list
+    all_models = ["gpt-4", "claude-3-opus", "claude-3-sonnet"]
+    healthy = await health_state.get_healthy_models(all_models)
+    print(f"Available models: {healthy}")
+
+    # Alias-aware state (integrates with model_group_alias)
+    alias_state = AliasAwareHealthState(router=litellm_router)
+    await alias_state.mark_rate_limited("claude-opus", 60.0)
+    # Both "claude-opus" and its target will be blocked
+
+    # Background health checker
+    benchmark = HealthBenchmark(
+        test_prompt="Say 'ok'",
+        timeout_seconds=30.0,
+        max_latency_ms=30000.0,
+    )
+
+    runner = HealthCheckRunner(benchmark=benchmark)
+
+    # Start periodic health checks
+    await runner.start_periodic_checks(
+        name="primary-check",
+        models=["gpt-4", "claude-3-opus"],
+        interval_seconds=60,
+        health_manager=health_state,
+        client=your_llm_client,  # Optional: custom client
+    )
+
+    # Later: stop health checks
+    await runner.stop_all()
+
+asyncio.run(main())
+```
+
+### Integration with LiteLLM Proxy
+
+```python
+# In your LiteLLM proxy startup
+from litellm_rate_limit import RateLimitCallback, HealthStateManager
+
+# Create shared health state
 health_state = HealthStateManager()
 
-# Track rate limits with alias support
-alias_state = AliasAwareHealthState(router=your_router)
+# Create callback with reference to health state
+callback = RateLimitCallback(
+    default_cooldown_seconds=60.0,
+)
+
+# The callback will automatically:
+# 1. Detect 429 errors from API responses
+# 2. Parse reset time from headers (Anthropic, OpenAI, standard)
+# 3. Update LiteLLM's cooldown_cache with precise TTL
 ```
+
+### Supported Rate Limit Headers
+
+The plugin extracts reset times from these headers (in priority order):
+
+| Header | Format | Provider |
+|--------|--------|----------|
+| `anthropic-ratelimit-unified-reset` | Unix timestamp | Anthropic |
+| `retry-after` | HTTP-date or seconds | Standard |
+| `x-ratelimit-reset` | Seconds | OpenAI-style |
+
+If no header is found, falls back to `default_cooldown_seconds` (default: 60s).
 
 ## License
 
