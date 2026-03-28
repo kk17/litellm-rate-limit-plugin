@@ -89,6 +89,29 @@ A LiteLLM Proxy plugin providing intelligent health checking and rate limit hand
 
 **Metrics**: Latency (ms), response validity, error tracking
 
+### 6. Provider Probe Config (`src/litellm_rate_limit/provider_probe.py`)
+
+**Purpose**: Share health status across models from the same provider.
+
+**Class**: `ProviderProbeConfig`
+
+**Key Behavior**:
+- Maps model prefixes to probe models
+- First model in config list is the probe model
+- Explicitly listed models get their own health status
+- Unlisted models share the probe model's health status
+
+**Example**:
+```yaml
+probe_models_by_provider:
+  minimax: ["minimax-m2"]
+  zai: ["glm-4.5-air", "glm-5"]
+```
+
+- `minimax-m2` health status used for ALL `minimax-*` models
+- `glm-4.5-air` used for unlisted `glm-*` models
+- `glm-5` has its own independent health status
+
 ## Data Flows
 
 ### Rate Limit Detection Flow
