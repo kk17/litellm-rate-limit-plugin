@@ -1,7 +1,8 @@
 """Unit tests for health checker."""
 
 import asyncio
-from unittest.mock import AsyncMock, Mock
+import contextlib
+from unittest.mock import Mock
 
 import pytest
 
@@ -211,9 +212,7 @@ class TestPeriodicChecks:
         await asyncio.sleep(0.25)
         stop_event.set()
 
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
 
         assert call_count >= 2

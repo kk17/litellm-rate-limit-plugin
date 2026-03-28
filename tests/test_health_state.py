@@ -1,7 +1,6 @@
 """Unit tests for HealthStateManager."""
 
 import asyncio
-import time
 from datetime import datetime, timezone
 
 import pytest

@@ -6,8 +6,8 @@ Integrates rate limit tracking with LiteLLM's model_group_alias feature.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Dict, List, Optional
+from datetime import datetime
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     try:
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 class RateLimitEntry:
     model_id: str
     until_monotonic: float
-    reset_at: Optional[datetime] = None
+    reset_at: datetime | None = None
 
 
 @dataclass
@@ -31,7 +31,7 @@ class AliasAwareHealthState:
     """
 
     router: Optional["LiteLLMRouter"] = None
-    _rate_limited_targets: Dict[str, RateLimitEntry] = field(default_factory=dict)
+    _rate_limited_targets: dict[str, RateLimitEntry] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def set_router(self, router: "LiteLLMRouter") -> None:
@@ -50,7 +50,7 @@ class AliasAwareHealthState:
         self,
         model_name: str,
         seconds_until_reset: float,
-        reset_at: Optional[datetime] = None,
+        reset_at: datetime | None = None,
     ) -> None:
         target = self._resolve_to_target(model_name)
         until_monotonic = time.monotonic() + seconds_until_reset
@@ -76,7 +76,7 @@ class AliasAwareHealthState:
 
             return True
 
-    async def get_healthy_models(self, all_models: List[str]) -> List[str]:
+    async def get_healthy_models(self, all_models: list[str]) -> list[str]:
         healthy = []
         for model in all_models:
             if not await self.is_rate_limited(model):
@@ -92,7 +92,7 @@ class AliasAwareHealthState:
                 return True
             return False
 
-    async def get_all_rate_limited(self) -> Dict[str, RateLimitEntry]:
+    async def get_all_rate_limited(self) -> dict[str, RateLimitEntry]:
         now = time.monotonic()
         async with self._lock:
             expired = [k for k, v in self._rate_limited_targets.items() if now >= v.until_monotonic]

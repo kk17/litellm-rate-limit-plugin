@@ -39,7 +39,7 @@ class RateLimitCallback(CustomLogger):
         request_data: dict,
         original_exception: Exception,
         user_api_key_dict: Optional["UserAPIKeyAuth"] = None,
-        traceback_str: Optional[str] = None,
+        traceback_str: str | None = None,
     ) -> None:
         if not is_rate_limit_error(original_exception):
             return
@@ -80,7 +80,7 @@ class RateLimitCallback(CustomLogger):
             else:
                 logger.warning("cooldown_cache has no set_cooldown method")
 
-    def _get_deployment_for_model(self, model: str) -> Optional[str]:
+    def _get_deployment_for_model(self, model: str) -> str | None:
         if self._router is None:
             return None
 

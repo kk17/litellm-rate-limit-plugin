@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from email.utils import formatdate
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 from freezegun import freeze_time
@@ -16,12 +16,12 @@ from litellm_rate_limit.parser import (
 
 
 class MockResponse:
-    def __init__(self, headers: Dict[str, Any]):
+    def __init__(self, headers: dict[str, Any]):
         self.headers = headers
 
 
 class MockError:
-    def __init__(self, headers: Dict[str, Any] = None, response_headers: Dict[str, Any] = None):
+    def __init__(self, headers: dict[str, Any] = None, response_headers: dict[str, Any] = None):
         self.headers = headers or {}
         if response_headers is not None:
             self.response = MockResponse(response_headers)
@@ -29,7 +29,7 @@ class MockError:
 
 
 class MockAnthropicError:
-    def __init__(self, headers: Dict[str, Any]):
+    def __init__(self, headers: dict[str, Any]):
         self._response = MockResponse(headers)
         self.headers = {}
 

@@ -4,8 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -14,11 +13,11 @@ logger = logging.getLogger(__name__)
 class ModelHealthStatus:
     model_id: str
     is_rate_limited: bool = False
-    rate_limited_until: Optional[float] = None
-    rate_limit_reset_at: Optional[datetime] = None
-    last_check_time: Optional[float] = None
+    rate_limited_until: float | None = None
+    rate_limit_reset_at: datetime | None = None
+    last_check_time: float | None = None
     consecutive_failures: int = 0
-    last_error: Optional[str] = None
+    last_error: str | None = None
 
 
 @dataclass
@@ -29,16 +28,16 @@ class HealthStateManager:
     Uses monotonic time for reliable duration tracking.
     """
 
-    _rate_limited_until: Dict[str, float] = field(default_factory=dict)
-    _rate_limit_reset_at: Dict[str, datetime] = field(default_factory=dict)
-    _model_status: Dict[str, ModelHealthStatus] = field(default_factory=dict)
+    _rate_limited_until: dict[str, float] = field(default_factory=dict)
+    _rate_limit_reset_at: dict[str, datetime] = field(default_factory=dict)
+    _model_status: dict[str, ModelHealthStatus] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def mark_rate_limited(
         self,
         model_id: str,
         seconds_until_reset: float,
-        reset_at: Optional[datetime] = None,
+        reset_at: datetime | None = None,
     ) -> None:
         until_monotonic = time.monotonic() + seconds_until_reset
 
@@ -85,14 +84,14 @@ class HealthStateManager:
 
             return True
 
-    async def get_healthy_models(self, all_models: List[str]) -> List[str]:
+    async def get_healthy_models(self, all_models: list[str]) -> list[str]:
         healthy = []
         for model in all_models:
             if not await self.is_rate_limited(model):
                 healthy.append(model)
         return healthy
 
-    async def get_rate_limited_models(self) -> Dict[str, datetime]:
+    async def get_rate_limited_models(self) -> dict[str, datetime]:
         result = {}
         now = time.monotonic()
 
@@ -124,7 +123,7 @@ class HealthStateManager:
                 return True
             return False
 
-    async def get_model_status(self, model_id: str) -> Optional[ModelHealthStatus]:
+    async def get_model_status(self, model_id: str) -> ModelHealthStatus | None:
         await self.is_rate_limited(model_id)
 
         async with self._lock:

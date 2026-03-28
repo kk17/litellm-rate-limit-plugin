@@ -1,11 +1,13 @@
 """Background health checker for proactive model benchmarking."""
 
 import asyncio
+import contextlib
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from litellm_rate_limit.health_state import HealthStateManager
@@ -23,8 +25,8 @@ class HealthStatus(Enum):
 class HealthCheckResult:
     model_id: str
     status: HealthStatus
-    latency_ms: Optional[float] = None
-    error: Optional[str] = None
+    latency_ms: float | None = None
+    error: str | None = None
     timestamp: float = field(default_factory=time.monotonic)
     response_valid: bool = True
 
@@ -42,7 +44,7 @@ class HealthBenchmark:
     async def run_health_check(
         self,
         model_id: str,
-        client: Optional[Callable] = None,
+        client: Callable | None = None,
     ) -> HealthCheckResult:
         async with self._check_semaphore:
             try:
@@ -95,11 +97,11 @@ class HealthBenchmark:
 
     async def run_periodic_checks(
         self,
-        models: List[str],
+        models: list[str],
         interval_seconds: int = 60,
         health_manager: Optional["HealthStateManager"] = None,
-        client: Optional[Callable] = None,
-        stop_event: Optional[asyncio.Event] = None,
+        client: Callable | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> None:
         if stop_event is None:
             stop_event = asyncio.Event()
@@ -135,10 +137,8 @@ class HealthBenchmark:
                     result.latency_ms or 0,
                 )
 
-            try:
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
-            except asyncio.TimeoutError:
-                pass
 
 
 @dataclass
@@ -146,16 +146,16 @@ class HealthCheckRunner:
     """Manages background health check tasks."""
 
     benchmark: HealthBenchmark = field(default_factory=HealthBenchmark)
-    _running_tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
-    _stop_events: Dict[str, asyncio.Event] = field(default_factory=dict)
+    _running_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    _stop_events: dict[str, asyncio.Event] = field(default_factory=dict)
 
     async def start_periodic_checks(
         self,
         name: str,
-        models: List[str],
+        models: list[str],
         interval_seconds: int = 60,
         health_manager: Optional["HealthStateManager"] = None,
-        client: Optional[Callable] = None,
+        client: Callable | None = None,
     ) -> None:
         if name in self._running_tasks:
             logger.warning("Health check task '%s' already running", name)
@@ -186,10 +186,8 @@ class HealthCheckRunner:
         task = self._running_tasks[name]
         task.cancel()
 
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
 
         del self._running_tasks[name]
         del self._stop_events[name]
@@ -203,5 +201,5 @@ class HealthCheckRunner:
     def is_running(self, name: str) -> bool:
         return name in self._running_tasks and not self._running_tasks[name].done()
 
-    def get_running_tasks(self) -> List[str]:
+    def get_running_tasks(self) -> list[str]:
         return [name for name, task in self._running_tasks.items() if not task.done()]

@@ -9,7 +9,6 @@ Supports:
 
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Optional
 
 DEFAULT_COOLDOWN_SECONDS = 60.0
 
@@ -31,9 +30,7 @@ def is_rate_limit_error(error: Exception) -> bool:
     if hasattr(error, "response") and hasattr(error.response, "status_code"):
         return error.response.status_code == 429
     # Check litellm exceptions
-    if hasattr(error, "llm_provider") and "429" in str(error):
-        return True
-    return False
+    return hasattr(error, "llm_provider") and "429" in str(error)
 
 
 def _get_headers_from_error(error: Exception) -> dict:
@@ -61,7 +58,7 @@ def _get_headers_from_error(error: Exception) -> dict:
     return {k.lower(): v for k, v in headers.items()}
 
 
-def _parse_anthropic_reset_header(value: str) -> Optional[datetime]:
+def _parse_anthropic_reset_header(value: str) -> datetime | None:
     """Parse Anthropic's ratelimit-unified-reset header.
 
     Format: Unix timestamp (seconds since epoch).
@@ -79,7 +76,7 @@ def _parse_anthropic_reset_header(value: str) -> Optional[datetime]:
         return None
 
 
-def _parse_retry_after_header(value: str) -> Optional[datetime]:
+def _parse_retry_after_header(value: str) -> datetime | None:
     """Parse retry-after header.
 
     Format can be:
@@ -109,7 +106,7 @@ def _parse_retry_after_header(value: str) -> Optional[datetime]:
         return None
 
 
-def _parse_x_ratelimit_reset_header(value: str) -> Optional[datetime]:
+def _parse_x_ratelimit_reset_header(value: str) -> datetime | None:
     """Parse x-ratelimit-reset header.
 
     Format: Seconds until reset.
@@ -127,7 +124,7 @@ def _parse_x_ratelimit_reset_header(value: str) -> Optional[datetime]:
         return None
 
 
-def extract_rate_limit_reset_dt(error: Exception) -> Optional[datetime]:
+def extract_rate_limit_reset_dt(error: Exception) -> datetime | None:
     """Parse reset time from response headers.
 
     Checks headers in order of preference:

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A LiteLLM Proxy plugin providing intelligent health checking and rate limit handling. Ports concepts from LazyRouter to work as a non-invasive callback plugin.
+A LiteLLM Proxy plugin providing intelligent health checking and rate limit handling. Work as a non-invasive callback plugin.
 
 ## Architecture
 
