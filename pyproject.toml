@@ -1,0 +1,51 @@
+[project]
+name = "litellm-rate-limit-plugin"
+version = "0.1.0"
+description = "Intelligent health checking and rate limit handling plugin for LiteLLM Proxy"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "litellm>=1.50.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "respx>=0.21.0",
+    "freezegun>=1.4.0",
+    "pre-commit>=3.0.0",
+    "ruff>=0.14.0",
+    "pylint>=4.0.0",
+    "isort>=7.0.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.isort]
+profile = "black"
+line_length = 110
+
+[tool.pylint]
+disable = ["too-few-public-methods", "too-many-arguments"]
+max-line-length = 110
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/litellm_rate_limit"]

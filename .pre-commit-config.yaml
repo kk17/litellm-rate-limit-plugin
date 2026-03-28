@@ -1,0 +1,43 @@
+fail_fast: false
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+        name: Check YAML files
+      - id: end-of-file-fixer
+        name: Add newline at end-of-file if required
+      - id: trailing-whitespace
+        name: Remove trailing whitespace if any
+  - repo: https://github.com/pycqa/isort
+    rev: 7.0.0
+    hooks:
+      - id: isort
+        name: Sort imports
+        args: ["--profile=black", "--line-length=110"]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.10
+    hooks:
+      - id: ruff-check
+        types_or: [python, pyi]
+        args: [--fix]
+      - id: ruff-format
+        types_or: [python, pyi]
+        args: ["--line-length=110"]
+  - repo: https://github.com/pycqa/pylint
+    rev: v4.0.4
+    hooks:
+      - id: pylint
+        name: Linting
+        stages: [pre-push]
+        args: ["src/litellm_rate_limit", "--disable=too-few-public-methods"]
+  - repo: local
+    hooks:
+      - id: unit tests
+        name: Unit Tests
+        stages: [manual]
+        entry: pytest
+        language: system
+        verbose: true
+        always_run: true
+        pass_filenames: false
