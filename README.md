@@ -21,12 +21,24 @@ pip install litellm-rate-limit-plugin
 
 ### Basic Configuration
 
-Add the callback to your LiteLLM config:
+1. Create a `proxy_handler.py` file in the same directory as your config.yaml:
+
+```python
+from litellm_rate_limit import RateLimitCallback
+
+rate_limit_callback = RateLimitCallback(
+    default_cooldown_seconds=60.0,
+)
+```
+
+2. Reference it in your LiteLLM config:
 
 ```yaml
 litellm_settings:
-  callbacks: ["rate_limit_callback"]
+  callbacks: proxy_handler.rate_limit_callback
 ```
+
+**Note**: LiteLLM expects callbacks in the format `python_filename.instance_name`.
 
 ### Fallback Configuration
 
