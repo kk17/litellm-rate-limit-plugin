@@ -60,7 +60,8 @@ class TestRateLimitCallback:
         router.cooldown_cache = cooldown_cache
         router.get_deployment = Mock(return_value=None)
 
-        callback = RateLimitCallback(router=router)
+        callback = RateLimitCallback()
+        callback.set_router(router)
 
         await callback._update_cooldown("claude-3-sonnet", 45.0)
 
@@ -77,7 +78,8 @@ class TestRateLimitCallback:
         router = Mock(spec=["cooldown_cache"])
         del router.cooldown_cache
 
-        callback = RateLimitCallback(router=router)
+        callback = RateLimitCallback()
+        callback.set_router(router)
 
         await callback._update_cooldown("claude-3-sonnet", 45.0)
 
@@ -92,7 +94,8 @@ class TestRateLimitCallback:
         deployment.model_info = {"id": "deployment-123"}
         router.get_deployment = Mock(return_value=deployment)
 
-        callback = RateLimitCallback(router=router)
+        callback = RateLimitCallback()
+        callback.set_router(router)
         result = callback._get_deployment_for_model("claude-3-sonnet")
 
         assert result == "deployment-123"
@@ -101,7 +104,40 @@ class TestRateLimitCallback:
         router = Mock()
         router.get_deployment = Mock(side_effect=Exception("Not found"))
 
-        callback = RateLimitCallback(router=router)
+        callback = RateLimitCallback()
+        callback.set_router(router)
         result = callback._get_deployment_for_model("claude-3-sonnet")
 
         assert result == "claude-3-sonnet"
+
+    @pytest.mark.asyncio
+    async def test_pre_call_hook_passes_healthy_model(self):
+        callback = RateLimitCallback()
+
+        data = {"model": "claude-3-sonnet"}
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=Mock(),
+            cache=Mock(),
+            data=data,
+            call_type="completion",
+        )
+
+        assert result == data
+
+    @pytest.mark.asyncio
+    async def test_pre_call_hook_blocks_rate_limited_model(self):
+        callback = RateLimitCallback()
+
+        await callback._health_state.mark_rate_limited("claude-3-sonnet", 60.0)
+
+        data = {"model": "claude-3-sonnet"}
+
+        with pytest.raises(Exception) as exc_info:
+            await callback.async_pre_call_hook(
+                user_api_key_dict=Mock(),
+                cache=Mock(),
+                data=data,
+                call_type="completion",
+            )
+
+        assert exc_info.value.status_code == 429
