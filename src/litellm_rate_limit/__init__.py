@@ -12,6 +12,7 @@ Features:
 
 from litellm_rate_limit.alias_aware_state import AliasAwareHealthState, RateLimitEntry
 from litellm_rate_limit.callback import RateLimitCallback
+from litellm_rate_limit.config import load_config
 from litellm_rate_limit.health_checker import (
     HealthBenchmark,
     HealthCheckResult,
@@ -42,6 +43,7 @@ __all__ = [
     "extract_rate_limit_reset_dt",
     "extract_rate_limit_reset_seconds",
     "is_rate_limit_error",
+    "load_config",
 ]
 
 __version__ = "0.1.0"
