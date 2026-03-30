@@ -4,7 +4,6 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.utils import DualCache
@@ -88,26 +87,20 @@ class RateLimitCallback(CustomLogger):
         data: dict,
         call_type: str,
     ) -> dict:
-        """Pre-call hook to check if model is rate-limited.
-
-        Raises HTTPException if the model is rate-limited, causing LiteLLM
-        to try the next available model via fallback routing.
-        """
         model = data.get("model", "")
-        if not model:
-            return data
+        logger.debug("Pre-call hook for model %s", model)
+        return data
 
-        is_limited = await self._health_state.is_rate_limited(model)
-
+        is_limited = await self._alias_state.is_rate_limited(model)
         if is_limited:
             logger.warning("Model %s is rate-limited, rejecting request", model)
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": f"Model {model} is rate-limited",
-                    "type": "rate_limit",
-                    "model": model,
-                },
+            from litellm.exceptions import RejectedRequestError
+
+            return RejectedRequestError(
+                message=f"Model {model} is rate-limited",
+                model=model,
+                llm_provider="",
+                request_data=data,
             )
 
         logger.debug("Pre-call check passed for model %s", model)
@@ -142,7 +135,7 @@ class RateLimitCallback(CustomLogger):
             cooldown_seconds,
         )
 
-        await self._health_state.mark_rate_limited(model, cooldown_seconds)
+        await self._alias_state.mark_rate_limited(model, cooldown_seconds)
 
         if self._router is not None:
             await self._update_cooldown(model, cooldown_seconds)
@@ -156,18 +149,16 @@ class RateLimitCallback(CustomLogger):
         async with self._cooldown_cache_lock:
             deployment = self._get_deployment_for_model(model)
             if deployment is None:
-                logger.debug("No deployment found for model %s, using model name", model)
                 deployment = model
 
             cooldown_cache = self._router.cooldown_cache
-            if hasattr(cooldown_cache, "set_cooldown"):
-                await cooldown_cache.set_cooldown(
-                    model_id=deployment,
-                    cooldown_time=cooldown_seconds,
-                )
-                logger.info("Set cooldown for deployment %s: %.1fs", deployment, cooldown_seconds)
-            else:
-                logger.warning("cooldown_cache has no set_cooldown method")
+            cooldown_cache.add_deployment_to_cooldown(
+                model_id=deployment,
+                original_exception=Exception("Rate limit detected"),
+                exception_status=429,
+                cooldown_time=cooldown_seconds,
+            )
+            logger.info("Set cooldown for deployment %s: %.1fs", deployment, cooldown_seconds)
 
     def _get_deployment_for_model(self, model: str) -> str | None:
         """Get the deployment ID for a model name."""
