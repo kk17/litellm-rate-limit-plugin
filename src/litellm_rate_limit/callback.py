@@ -1,4 +1,4 @@
-"""Custom callback for LiteLLM to handle rate limits."""
+"""Custom callback for LiteLLM to handle rate limits and unhealthy models."""
 
 import asyncio
 import logging
@@ -12,7 +12,7 @@ from litellm_rate_limit.alias_aware_state import AliasAwareHealthState
 from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
 from litellm_rate_limit.health_state import HealthStateManager
 from litellm_rate_limit.parser import extract_rate_limit_reset_seconds, is_rate_limit_error
-from litellm_rate_limit.provider_probe import ProviderProbeConfig
+from litellm_rate_limit.provider_probe import ProviderProbeConfig, _extract_model_prefix
 
 if TYPE_CHECKING:
     from litellm.router import Router as LiteLLMRouter
@@ -21,25 +21,26 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimitCallback(CustomLogger):
-    """LiteLLM callback that intercepts rate limit errors and blocks rate-limited models.
+    """LiteLLM callback that intercepts API errors and blocks unhealthy models.
 
-    Features:
-    - Pre-call hook to skip rate-limited models
-    - Post-failure hook to detect 429 errors and extract reset times
-    - Optional background health checking
-    - Provider probe model support for shared health status
+    Handles 429 rate limits with header-parsed reset times, and all other API
+    errors (except 401/403) with per-provider or default cooldown.
     """
+
+    _SKIP_STATUS_CODES = {401, 403}
 
     def __init__(
         self,
         default_cooldown_seconds: float = 60.0,
         probe_models_by_provider: dict[str, list[str]] | None = None,
+        provider_cooldown_seconds: dict[str, float] | None = None,
         health_check_enabled: bool = False,
         health_check_interval_seconds: int = 60,
         health_check_prompt: str = "Say 'ok'",
         health_check_max_latency_ms: float = 30000.0,
     ):
         self.default_cooldown_seconds = default_cooldown_seconds
+        self.provider_cooldown_seconds = provider_cooldown_seconds or {}
         self._router: LiteLLMRouter | None = None
         self._cooldown_cache_lock = asyncio.Lock()
 
@@ -68,14 +69,14 @@ class RateLimitCallback(CustomLogger):
             logger.setLevel(logging.INFO)
 
         logger.info(
-            "RateLimitCallback initialized: cooldown=%.1fs, health_check=%s, probe_config=%s",
+            "RateLimitCallback initialized: cooldown=%.1fs, provider_cooldown=%s, health_check=%s, probe_config=%s",
             default_cooldown_seconds,
+            bool(self.provider_cooldown_seconds),
             health_check_enabled,
             bool(probe_models_by_provider),
         )
 
     def set_router(self, router: "LiteLLMRouter") -> None:
-        """Set the router reference for cooldown cache access."""
         self._router = router
         self._alias_state.set_router(router)
         logger.info("Router reference set")
@@ -91,21 +92,6 @@ class RateLimitCallback(CustomLogger):
         logger.debug("Pre-call hook for model %s", model)
         return data
 
-        is_limited = await self._alias_state.is_rate_limited(model)
-        if is_limited:
-            logger.warning("Model %s is rate-limited, rejecting request", model)
-            from litellm.exceptions import RejectedRequestError
-
-            return RejectedRequestError(
-                message=f"Model {model} is rate-limited",
-                model=model,
-                llm_provider="",
-                request_data=data,
-            )
-
-        logger.debug("Pre-call check passed for model %s", model)
-        return data
-
     async def async_post_call_failure_hook(
         self,
         request_data: dict,
@@ -113,26 +99,36 @@ class RateLimitCallback(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth | None = None,
         traceback_str: str | None = None,
     ) -> None:
-        """Post-failure hook to detect rate limit errors and extract reset times."""
         logger.debug(
             "Post-failure hook called: exception=%s",
             type(original_exception).__name__,
         )
 
-        if not is_rate_limit_error(original_exception):
-            logger.debug("Not a rate limit error, skipping")
+        status_code = self._get_status_code(original_exception)
+
+        if status_code in self._SKIP_STATUS_CODES:
+            logger.debug("Auth/permission error (%s), skipping", status_code)
+            return
+
+        if status_code is None:
+            logger.debug("No status code on exception, skipping")
             return
 
         model = request_data.get("model", "unknown")
-        cooldown_seconds = extract_rate_limit_reset_seconds(
-            original_exception,
-            default=self.default_cooldown_seconds,
-        )
+
+        if is_rate_limit_error(original_exception):
+            cooldown_seconds = extract_rate_limit_reset_seconds(
+                original_exception,
+                default=self._get_cooldown_for_model(model),
+            )
+        else:
+            cooldown_seconds = self._get_cooldown_for_model(model)
 
         logger.info(
-            "Rate limit detected for model %s, cooldown for %.1f seconds",
+            "Marking model %s unhealthy for %.1f seconds (status=%s)",
             model,
             cooldown_seconds,
+            status_code,
         )
 
         await self._alias_state.mark_rate_limited(model, cooldown_seconds)
@@ -140,8 +136,21 @@ class RateLimitCallback(CustomLogger):
         if self._router is not None:
             await self._update_cooldown(model, cooldown_seconds)
 
+    @staticmethod
+    def _get_status_code(error: Exception) -> int | None:
+        if hasattr(error, "status_code") and isinstance(error.status_code, int):
+            return error.status_code
+        if hasattr(error, "response") and hasattr(error.response, "status_code"):
+            return error.response.status_code
+        return None
+
+    def _get_cooldown_for_model(self, model: str) -> float:
+        prefix = _extract_model_prefix(model)
+        if prefix in self.provider_cooldown_seconds:
+            return self.provider_cooldown_seconds[prefix]
+        return self.default_cooldown_seconds
+
     async def _update_cooldown(self, model: str, cooldown_seconds: float) -> None:
-        """Update LiteLLM's cooldown cache."""
         if not hasattr(self._router, "cooldown_cache"):
             logger.debug("Router has no cooldown_cache attribute")
             return
@@ -161,7 +170,6 @@ class RateLimitCallback(CustomLogger):
             logger.info("Set cooldown for deployment %s: %.1fs", deployment, cooldown_seconds)
 
     def _get_deployment_for_model(self, model: str) -> str | None:
-        """Get the deployment ID for a model name."""
         if self._router is None:
             return None
 
@@ -176,7 +184,6 @@ class RateLimitCallback(CustomLogger):
         return model
 
     async def start_health_checks(self, models: list[str]) -> None:
-        """Start background health checking for the given models."""
         if not self._health_runner:
             logger.warning("Health checker not enabled")
             return
@@ -190,12 +197,10 @@ class RateLimitCallback(CustomLogger):
         logger.info("Started health checks for %d models", len(models))
 
     async def stop_health_checks(self) -> None:
-        """Stop all background health checks."""
         if self._health_runner:
             await self._health_runner.stop_all()
             logger.info("Stopped health checks")
 
     @property
     def health_state(self) -> HealthStateManager:
-        """Get the health state manager for external access."""
         return self._health_state

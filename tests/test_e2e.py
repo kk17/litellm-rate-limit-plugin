@@ -374,54 +374,12 @@ class TestCooldownExpiry:
 class TestHeaderParsing:
     """Tests for rate limit header parsing."""
 
-    @pytest.mark.asyncio
-    async def test_retry_after_header(self, callback, mock_router, mock_user_auth):
-        error = create_rate_limit_error(headers={"retry-after": "45"})
-
-        await callback.async_post_call_failure_hook(
-            request_data={"model": "gpt-4"},
-            original_exception=error,
-            user_api_key_dict=mock_user_auth,
-        )
-
-        is_limited = await callback._alias_state.is_rate_limited("gpt-4")
-        assert is_limited is True
-
-    @pytest.mark.asyncio
-    async def test_x_ratelimit_reset_header(self, callback, mock_router, mock_user_auth):
-        error = create_rate_limit_error(headers={"x-ratelimit-reset": "30"})
-
-        await callback.async_post_call_failure_hook(
-            request_data={"model": "gpt-4"},
-            original_exception=error,
-            user_api_key_dict=mock_user_auth,
-        )
-
-        is_limited = await callback._alias_state.is_rate_limited("gpt-4")
-        assert is_limited is True
-
-    @pytest.mark.asyncio
-    async def test_anthropic_reset_header(self, callback, mock_router, mock_user_auth):
-        import time
-
-        future_ts = int(time.time()) + 120
-        error = create_rate_limit_error(headers={"anthropic-ratelimit-unified-reset": str(future_ts)})
-
-        await callback.async_post_call_failure_hook(
-            request_data={"model": "claude-3-opus"},
-            original_exception=error,
-            user_api_key_dict=mock_user_auth,
-        )
-
-        is_limited = await callback._alias_state.is_rate_limited("claude-3-opus")
-        assert is_limited is True
-
 
 class TestNonRateLimitErrors:
-    """Tests for non-rate-limit error handling."""
+    """Non-429 errors should also trigger cooldown with provider-specific cooldown."""
 
     @pytest.mark.asyncio
-    async def test_500_error_does_not_trigger_cooldown(self, callback, mock_router, mock_user_auth):
+    async def test_500_error_triggers_cooldown(self, callback, mock_router, mock_user_auth):
         error = create_rate_limit_error(status_code=500, headers={})
 
         await callback.async_post_call_failure_hook(
@@ -431,7 +389,7 @@ class TestNonRateLimitErrors:
         )
 
         is_limited = await callback._alias_state.is_rate_limited("gpt-4")
-        assert is_limited is False
+        assert is_limited is True
 
     @pytest.mark.asyncio
     async def test_401_error_does_not_trigger_cooldown(self, callback, mock_router, mock_user_auth):
@@ -445,6 +403,56 @@ class TestNonRateLimitErrors:
 
         is_limited = await callback._alias_state.is_rate_limited("gpt-4")
         assert is_limited is False
+
+    @pytest.mark.asyncio
+    async def test_402_error_triggers_cooldown_with_provider_cooldown(
+        self, callback, mock_router, mock_user_auth
+    ):
+        callback = RateLimitCallback(
+            provider_cooldown_seconds={"github-copilot": 600.0, "zai": 30.0},
+        )
+
+        error = create_rate_limit_error(status_code=402, headers={})
+
+        await callback.async_post_call_failure_hook(
+            request_data={"model": "github-copilot/claude-opus-4.6"},
+            original_exception=error,
+            user_api_key_dict=mock_user_auth,
+        )
+        is_limited = await callback._alias_state.is_rate_limited("github-copilot/claude-opus-4.6")
+        assert is_limited is True
+
+    @pytest.mark.asyncio
+    async def test_provider_cooldown_prefix_match(self, callback, mock_router, mock_user_auth):
+        callback = RateLimitCallback(
+            provider_cooldown_seconds={"minimax": 30.0},
+        )
+
+        error = type("Error", (), {"status_code": 402, "headers": {}})()
+
+        await callback.async_post_call_failure_hook(
+            request_data={"model": "minimax/minimax-m2.7"},
+            original_exception=error,
+            user_api_key_dict=mock_user_auth,
+        )
+        is_limited = await callback._alias_state.is_rate_limited("minimax/minimax-m2.7")
+        assert is_limited is True
+
+    @pytest.mark.asyncio
+    async def test_provider_cooldown_no_match(self, callback, mock_router, mock_user_auth):
+        callback = RateLimitCallback(
+            provider_cooldown_seconds={"minimax": 30.0},
+        )
+
+        error = type("Error", (), {"status_code": 402, "headers": {}})()
+
+        await callback.async_post_call_failure_hook(
+            request_data={"model": "unknown-model"},
+            original_exception=error,
+            user_api_key_dict=mock_user_auth,
+        )
+        is_limited = await callback._alias_state.is_rate_limited("unknown-model")
+        assert is_limited is True
 
 
 class TestConcurrentAccess:

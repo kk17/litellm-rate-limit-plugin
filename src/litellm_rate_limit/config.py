@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "default_cooldown_seconds": 60.0,
+    "provider_cooldown_seconds": {},
     "probe_models_by_provider": {},
     "health_check_enabled": False,
     "health_check_interval_seconds": 60,
@@ -145,5 +146,14 @@ def load_config() -> dict[str, Any]:
         parsed = _parse_probe_models(probe_models_env)
         if parsed:
             config["probe_models_by_provider"] = parsed
+
+    provider_cooldown_env = os.environ.get("RATE_LIMIT_PROVIDER_COOLDOWN")
+    if provider_cooldown_env:
+        try:
+            parsed = json.loads(provider_cooldown_env)
+            if isinstance(parsed, dict):
+                config["provider_cooldown_seconds"] = {k: float(v) for k, v in parsed.items()}
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.warning("Failed to parse RATE_LIMIT_PROVIDER_COOLDOWN: %s", e)
 
     return config
