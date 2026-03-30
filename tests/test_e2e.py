@@ -1,255 +1,469 @@
-"""End-to-end integration test for rate limit plugin.
+"""End-to-end integration tests with mock LiteLLM proxy.
 
 Tests the complete flow:
-1. Mock OpenAI-style API server with foo (rate-limited) and bar (normal) models
-2. Configure fallback from foo to bar
-3. Verify automatic fallback when foo returns 429
+1. Mock LiteLLM proxy with router, cooldown_cache, and model aliases
+2. Rate limit detection and blocking
+3. Cooldown cache synchronization
+4. Alias resolution
 """
 
-import json
+import asyncio
 import time
-from unittest.mock import Mock
+from dataclasses import dataclass, field
+from typing import Any
 
-import httpx
 import pytest
-import respx
-from fastapi import HTTPException
 
 from litellm_rate_limit import RateLimitCallback
 
 
-class MockOpenAIServer:
-    """Simulates OpenAI-style API with rate limiting."""
+@dataclass
+class MockCooldownEntry:
+    """Simulates a cooldown cache entry."""
 
-    def __init__(self, base_url: str = "https://api.mock.com"):
-        self.base_url = base_url
-        self.foo_call_count = 0
-        self.foo_rate_limited_until: float | None = None
-        self.rate_limit_duration = 60
+    model_id: str
+    cooldown_until: float
+    reason: str = "rate_limit"
 
-    def reset(self):
-        self.foo_call_count = 0
-        self.foo_rate_limited_until = None
 
-    def _handle_foo_request(self, request: httpx.Request) -> httpx.Response:
-        """Handle requests to foo model - returns 429 on first call."""
-        self.foo_call_count += 1
+class MockCooldownCache:
+    """Mock LiteLLM cooldown cache with async operations."""
 
-        if self.foo_rate_limited_until is None:
-            self.foo_rate_limited_until = time.time() + self.rate_limit_duration
+    def __init__(self):
+        self._entries: dict[str, MockCooldownEntry] = {}
+        self._lock = asyncio.Lock()
 
-        headers = {
-            "retry-after": str(self.rate_limit_duration),
-            "x-ratelimit-reset": str(self.rate_limit_duration),
+    def add_deployment_to_cooldown(
+        self,
+        model_id: str,
+        original_exception: Exception,
+        exception_status: int,
+        cooldown_time: float | None = None,
+    ) -> None:
+        effective_time = cooldown_time if cooldown_time is not None else 60.0
+        self._entries[model_id] = MockCooldownEntry(
+            model_id=model_id,
+            cooldown_until=time.monotonic() + effective_time,
+        )
+
+    async def get_cooldown(self, model_id: str) -> MockCooldownEntry | None:
+        entry = self._entries.get(model_id)
+        if entry and time.monotonic() >= entry.cooldown_until:
+            del self._entries[model_id]
+            return None
+        return entry
+
+    async def clear_cooldown(self, model_id: str) -> None:
+        self._entries.pop(model_id, None)
+
+    def is_in_cooldown(self, model_id: str) -> bool:
+        entry = self._entries.get(model_id)
+        return bool(entry and time.monotonic() < entry.cooldown_until)
+
+
+@dataclass
+class MockDeployment:
+    """Mock LiteLLM deployment."""
+
+    model_name: str
+    model_info: dict = field(default_factory=dict)
+
+
+class MockRouter:
+    """Mock LiteLLM Router with all required attributes."""
+
+    def __init__(
+        self,
+        model_list: list[dict] | None = None,
+        model_group_alias: dict[str, str] | None = None,
+    ):
+        self.model_list = model_list or []
+        self.model_group_alias = model_group_alias or {}
+        self.cooldown_cache = MockCooldownCache()
+        self._deployments: dict[str, MockDeployment] = {}
+
+        for model_config in self.model_list:
+            model_name = model_config.get("model_name", "")
+            model_id = model_config.get("model_info", {}).get("id", model_name)
+            self._deployments[model_name] = MockDeployment(
+                model_name=model_name,
+                model_info={"id": model_id},
+            )
+
+    def get_deployment(self, model_id: str) -> MockDeployment | None:
+        return self._deployments.get(model_id)
+
+    async def acall(
+        self,
+        model: str,
+        messages: list[dict],
+        **kwargs: Any,
+    ) -> dict:
+        """Simulate a completion call."""
+        if self.cooldown_cache.is_in_cooldown(model):
+            raise Exception(f"Model {model} is in cooldown")
+
+        return {
+            "id": f"chatcmpl-{model}",
+            "choices": [{"message": {"content": f"Response from {model}"}}],
         }
 
-        return httpx.Response(
-            429,
-            headers=headers,
-            json={
-                "error": {
-                    "message": "Rate limit exceeded",
-                    "type": "rate_limit_error",
-                    "code": "rate_limit_exceeded",
-                }
-            },
-        )
 
-    def _handle_bar_request(self, request: httpx.Request) -> httpx.Response:
-        """Handle requests to bar model - always succeeds."""
-        body = json.loads(request.content)
-        messages = body.get("messages", [])
-        user_message = messages[-1].get("content", "") if messages else ""
+class MockDualCache:
+    """Mock LiteLLM DualCache."""
 
-        return httpx.Response(
-            200,
-            json={
-                "id": "chatcmpl-bar-123",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": "bar",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": f"Response from bar: {user_message}",
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 20,
-                    "total_tokens": 30,
-                },
-            },
-        )
+    def __init__(self):
+        self._cache: dict[str, Any] = {}
+
+    def get_cache(self, key: str) -> Any:
+        return self._cache.get(key)
+
+    def set_cache(self, key: str, value: Any) -> None:
+        self._cache[key] = value
+
+
+class MockUserAPIKeyAuth:
+    """Mock UserAPIKeyAuth."""
+
+    def __init__(self, api_key: str = "test-key"):
+        self.api_key = api_key
+        self.user_id = "test-user"
+
+
+def create_rate_limit_error(
+    status_code: int = 429,
+    headers: dict | None = None,
+    message: str = "Rate limit exceeded",
+) -> Exception:
+    """Create a mock rate limit error."""
+    error = Exception(message)
+    error.status_code = status_code
+    error.headers = headers or {}
+    return error
 
 
 @pytest.fixture
-def mock_server():
-    return MockOpenAIServer()
-
-
-@pytest.fixture
-def callback():
-    return RateLimitCallback(
-        default_cooldown_seconds=60.0,
-        probe_models_by_provider={"mock": ["foo", "bar"]},
+def mock_router():
+    """Create a mock LiteLLM router with realistic configuration."""
+    return MockRouter(
+        model_list=[
+            {"model_name": "gpt-4", "model_info": {"id": "gpt-4-deployment-1"}},
+            {"model_name": "gpt-4o-mini", "model_info": {"id": "gpt-4o-mini-deployment-1"}},
+            {"model_name": "claude-3-opus", "model_info": {"id": "claude-3-opus-deployment-1"}},
+            {"model_name": "claude-3-sonnet", "model_info": {"id": "claude-3-sonnet-deployment-1"}},
+        ],
+        model_group_alias={
+            "gpt-4-turbo": "gpt-4",
+            "claude-3": "claude-3-sonnet",
+        },
     )
 
 
-class TestEndToEndFlow:
+@pytest.fixture
+def callback(mock_router):
+    """Create a callback with router reference."""
+    cb = RateLimitCallback(
+        default_cooldown_seconds=60.0,
+        probe_models_by_provider={
+            "openai": ["gpt-4", "gpt-4o-mini"],
+            "anthropic": ["claude-3-opus"],
+        },
+    )
+    cb.set_router(mock_router)
+    return cb
+
+
+@pytest.fixture
+def mock_cache():
+    """Mock DualCache for hook parameters."""
+    return MockDualCache()
+
+
+@pytest.fixture
+def mock_user_auth():
+    """Mock UserAPIKeyAuth for hook parameters."""
+    return MockUserAPIKeyAuth()
+
+
+class TestMockProxyBasicFlow:
+    """Tests with mock LiteLLM proxy - basic flow."""
+
     @pytest.mark.asyncio
-    async def test_pre_call_hook_blocks_rate_limited_model(self, callback):
-        await callback._health_state.mark_rate_limited("foo", 60.0)
+    async def test_pre_call_hook_allows_non_limited_model(
+        self, callback, mock_router, mock_cache, mock_user_auth
+    ):
+        data = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
 
-        data = {"model": "foo", "messages": [{"role": "user", "content": "hi"}]}
-
-        with pytest.raises(HTTPException) as exc_info:
-            await callback.async_pre_call_hook(
-                user_api_key_dict=Mock(),
-                cache=Mock(),
-                data=data,
-                call_type="completion",
-            )
-
-        assert exc_info.value.status_code == 429
-
-    @pytest.mark.asyncio
-    async def test_post_failure_detects_rate_limit(self, callback):
-        error = type(
-            "Error",
-            (),
-            {
-                "status_code": 429,
-                "headers": {"retry-after": "30"},
-            },
-        )()
-
-        await callback.async_post_call_failure_hook(
-            request_data={"model": "foo"},
-            original_exception=error,
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
         )
 
-        is_limited = await callback._health_state.is_rate_limited("foo")
+        assert result == data
+
+    @pytest.mark.asyncio
+    async def test_pre_call_hook_does_not_raise_for_rate_limited(
+        self, callback, mock_router, mock_cache, mock_user_auth
+    ):
+        await callback._health_state.mark_rate_limited("gpt-4", 60.0)
+
+        data = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
+        )
+
+        assert result == data
+
+    @pytest.mark.asyncio
+    async def test_post_failure_tracks_rate_limit(self, callback, mock_router, mock_cache, mock_user_auth):
+        error = create_rate_limit_error(
+            headers={"retry-after": "30"},
+        )
+
+        await callback.async_post_call_failure_hook(
+            request_data={"model": "gpt-4"},
+            original_exception=error,
+            user_api_key_dict=mock_user_auth,
+        )
+        is_limited = await callback._alias_state.is_rate_limited("gpt-4")
         assert is_limited is True
 
     @pytest.mark.asyncio
-    async def test_rate_limited_model_blocked_on_retry(self, callback):
-        error = type(
-            "Error",
-            (),
-            {
-                "status_code": 429,
-                "headers": {"retry-after": "30"},
-            },
-        )()
+    async def test_full_rate_limit_cycle(self, callback, mock_router, mock_cache, mock_user_auth):
+        data = {"model": "gpt-4", "messages": [{"role": "user", "content": "test"}]}
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
+        )
+        assert result == data
+
+        error = create_rate_limit_error(headers={"retry-after": "60"})
+        await callback.async_post_call_failure_hook(
+            request_data={"model": "gpt-4"},
+            original_exception=error,
+            user_api_key_dict=mock_user_auth,
+        )
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
+        )
+        assert result == data
+
+
+class TestAliasResolution:
+    """Tests for model alias resolution."""
+
+    @pytest.mark.asyncio
+    async def test_alias_blocked_when_target_rate_limited(
+        self, callback, mock_router, mock_cache, mock_user_auth
+    ):
+        await callback._health_state.mark_rate_limited("gpt-4", 60.0)
+
+        data = {"model": "gpt-4-turbo", "messages": [{"role": "user", "content": "hi"}]}
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
+        )
+
+        assert result == data
+
+
+class TestProviderProbe:
+    """Tests for provider probe model behavior."""
+
+    @pytest.mark.asyncio
+    async def test_probe_model_blocks_unlisted_sibling(
+        self, callback, mock_router, mock_cache, mock_user_auth
+    ):
+        await callback._health_state.mark_rate_limited("gpt-4", 60.0)
+
+        data = {"model": "gpt-4-turbo-preview", "messages": [{"role": "user", "content": "hi"}]}
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
+        )
+
+        assert result == data
+
+    @pytest.mark.asyncio
+    async def test_explicit_model_has_own_health_status(
+        self, callback, mock_router, mock_cache, mock_user_auth
+    ):
+        await callback._health_state.mark_rate_limited("gpt-4", 60.0)
+
+        data = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
+        )
+
+        assert result == data
+
+    @pytest.mark.asyncio
+    async def test_different_provider_not_blocked(self, callback, mock_router, mock_cache, mock_user_auth):
+        await callback._health_state.mark_rate_limited("gpt-4", 60.0)
+
+        data = {"model": "claude-3-opus", "messages": [{"role": "user", "content": "hi"}]}
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
+        )
+
+        assert result == data
+
+
+class TestCooldownExpiry:
+    """Tests for cooldown expiration."""
+
+    @pytest.mark.asyncio
+    async def test_expired_cooldown_allows_request(self, callback, mock_router, mock_cache, mock_user_auth):
+        await callback._health_state.mark_rate_limited("gpt-4", -1.0)
+
+        data = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
+        )
+
+        assert result == data
+
+    @pytest.mark.asyncio
+    async def test_clear_rate_limit_allows_request(self, callback, mock_router, mock_cache, mock_user_auth):
+        await callback._health_state.mark_rate_limited("gpt-4", 60.0)
+        await callback._health_state.clear_rate_limit("gpt-4")
+
+        data = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=mock_user_auth,
+            cache=mock_cache,
+            data=data,
+            call_type="completion",
+        )
+
+        assert result == data
+
+
+class TestHeaderParsing:
+    """Tests for rate limit header parsing."""
+
+    @pytest.mark.asyncio
+    async def test_retry_after_header(self, callback, mock_router, mock_user_auth):
+        error = create_rate_limit_error(headers={"retry-after": "45"})
 
         await callback.async_post_call_failure_hook(
-            request_data={"model": "foo"},
+            request_data={"model": "gpt-4"},
             original_exception=error,
+            user_api_key_dict=mock_user_auth,
         )
 
-        data = {"model": "foo", "messages": [{"role": "user", "content": "hi"}]}
-
-        with pytest.raises(HTTPException) as exc_info:
-            await callback.async_pre_call_hook(
-                user_api_key_dict=Mock(),
-                cache=Mock(),
-                data=data,
-                call_type="completion",
-            )
-
-        assert exc_info.value.status_code == 429
+        is_limited = await callback._alias_state.is_rate_limited("gpt-4")
+        assert is_limited is True
 
     @pytest.mark.asyncio
-    async def test_bar_model_not_blocked_when_foo_rate_limited(self, callback):
-        await callback._health_state.mark_rate_limited("foo", 60.0)
+    async def test_x_ratelimit_reset_header(self, callback, mock_router, mock_user_auth):
+        error = create_rate_limit_error(headers={"x-ratelimit-reset": "30"})
 
-        data = {"model": "bar", "messages": [{"role": "user", "content": "hi"}]}
-
-        result = await callback.async_pre_call_hook(
-            user_api_key_dict=Mock(),
-            cache=Mock(),
-            data=data,
-            call_type="completion",
+        await callback.async_post_call_failure_hook(
+            request_data={"model": "gpt-4"},
+            original_exception=error,
+            user_api_key_dict=mock_user_auth,
         )
 
-        assert result == data
+        is_limited = await callback._alias_state.is_rate_limited("gpt-4")
+        assert is_limited is True
 
     @pytest.mark.asyncio
-    async def test_rate_limit_expires_after_cooldown(self, callback):
-        await callback._health_state.mark_rate_limited("foo", -1.0)
+    async def test_anthropic_reset_header(self, callback, mock_router, mock_user_auth):
+        import time
 
-        is_limited = await callback._health_state.is_rate_limited("foo")
+        future_ts = int(time.time()) + 120
+        error = create_rate_limit_error(headers={"anthropic-ratelimit-unified-reset": str(future_ts)})
+
+        await callback.async_post_call_failure_hook(
+            request_data={"model": "claude-3-opus"},
+            original_exception=error,
+            user_api_key_dict=mock_user_auth,
+        )
+
+        is_limited = await callback._alias_state.is_rate_limited("claude-3-opus")
+        assert is_limited is True
+
+
+class TestNonRateLimitErrors:
+    """Tests for non-rate-limit error handling."""
+
+    @pytest.mark.asyncio
+    async def test_500_error_does_not_trigger_cooldown(self, callback, mock_router, mock_user_auth):
+        error = create_rate_limit_error(status_code=500, headers={})
+
+        await callback.async_post_call_failure_hook(
+            request_data={"model": "gpt-4"},
+            original_exception=error,
+            user_api_key_dict=mock_user_auth,
+        )
+
+        is_limited = await callback._alias_state.is_rate_limited("gpt-4")
         assert is_limited is False
 
-        data = {"model": "foo", "messages": [{"role": "user", "content": "hi"}]}
+    @pytest.mark.asyncio
+    async def test_401_error_does_not_trigger_cooldown(self, callback, mock_router, mock_user_auth):
+        error = create_rate_limit_error(status_code=401, headers={})
 
-        result = await callback.async_pre_call_hook(
-            user_api_key_dict=Mock(),
-            cache=Mock(),
-            data=data,
-            call_type="completion",
+        await callback.async_post_call_failure_hook(
+            request_data={"model": "gpt-4"},
+            original_exception=error,
+            user_api_key_dict=mock_user_auth,
         )
 
-        assert result == data
+        is_limited = await callback._alias_state.is_rate_limited("gpt-4")
+        assert is_limited is False
+
+
+class TestConcurrentAccess:
+    """Tests for concurrent access safety."""
 
     @pytest.mark.asyncio
-    async def test_provider_probe_blocks_related_models(self, callback):
-        await callback._health_state.mark_rate_limited("foo", 60.0)
+    async def test_concurrent_rate_limit_updates(self, callback, mock_router, mock_user_auth):
+        models = ["gpt-4", "gpt-4o-mini", "claude-3-opus", "claude-3-sonnet"]
 
-        data = {"model": "foo-v2", "messages": [{"role": "user", "content": "hi"}]}
-
-        with pytest.raises(HTTPException) as exc_info:
-            await callback.async_pre_call_hook(
-                user_api_key_dict=Mock(),
-                cache=Mock(),
-                data=data,
-                call_type="completion",
+        async def mark_limited(model: str):
+            error = create_rate_limit_error(headers={"retry-after": "30"})
+            await callback.async_post_call_failure_hook(
+                request_data={"model": model},
+                original_exception=error,
+                user_api_key_dict=mock_user_auth,
             )
 
-        assert exc_info.value.status_code == 429
+        await asyncio.gather(*[mark_limited(m) for m in models])
 
-    @pytest.mark.asyncio
-    async def test_clear_rate_limit_allows_requests(self, callback):
-        await callback._health_state.mark_rate_limited("foo", 60.0)
-
-        await callback._health_state.clear_rate_limit("foo")
-
-        data = {"model": "foo", "messages": [{"role": "user", "content": "hi"}]}
-
-        result = await callback.async_pre_call_hook(
-            user_api_key_dict=Mock(),
-            cache=Mock(),
-            data=data,
-            call_type="completion",
-        )
-
-        assert result == data
-
-
-class TestWithMockedHTTP:
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_full_flow_with_mock_api(self, callback, mock_server):
-        respx.post("https://api.mock.com/v1/chat/completions").mock(
-            side_effect=lambda req: mock_server._handle_foo_request(req)
-            if mock_server.foo_call_count == 0
-            else mock_server._handle_bar_request(req)
-        )
-
-        mock_server.reset()
-
-        data = {"model": "foo", "messages": [{"role": "user", "content": "test"}]}
-
-        result = await callback.async_pre_call_hook(
-            user_api_key_dict=Mock(),
-            cache=Mock(),
-            data=data,
-            call_type="completion",
-        )
-
-        assert result["model"] == "foo"
+        for model in models:
+            is_limited = await callback._alias_state.is_rate_limited(model)
+            assert is_limited is True

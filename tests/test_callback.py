@@ -1,6 +1,6 @@
 """Unit tests for RateLimitCallback."""
 
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -54,7 +54,7 @@ class TestRateLimitCallback:
     @pytest.mark.asyncio
     async def test_update_cooldown_with_router(self):
         cooldown_cache = MagicMock()
-        cooldown_cache.set_cooldown = AsyncMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock()
 
         router = Mock()
         router.cooldown_cache = cooldown_cache
@@ -65,7 +65,7 @@ class TestRateLimitCallback:
 
         await callback._update_cooldown("claude-3-sonnet", 45.0)
 
-        cooldown_cache.set_cooldown.assert_called_once()
+        cooldown_cache.add_deployment_to_cooldown.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_update_cooldown_no_router(self):
@@ -125,19 +125,18 @@ class TestRateLimitCallback:
         assert result == data
 
     @pytest.mark.asyncio
-    async def test_pre_call_hook_blocks_rate_limited_model(self):
+    async def test_pre_call_hook_does_not_raise_for_rate_limited(self):
         callback = RateLimitCallback()
 
         await callback._health_state.mark_rate_limited("claude-3-sonnet", 60.0)
 
         data = {"model": "claude-3-sonnet"}
 
-        with pytest.raises(Exception) as exc_info:
-            await callback.async_pre_call_hook(
-                user_api_key_dict=Mock(),
-                cache=Mock(),
-                data=data,
-                call_type="completion",
-            )
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=Mock(),
+            cache=Mock(),
+            data=data,
+            call_type="completion",
+        )
 
-        assert exc_info.value.status_code == 429
+        assert result == data
