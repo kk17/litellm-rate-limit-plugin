@@ -32,11 +32,43 @@ DEFAULT_CONFIG = {
 
 
 def _find_config_file() -> Path | None:
-    """Find the LiteLLM config file."""
+    """Find the LiteLLM config file.
+
+    Priority:
+    1. LiteLLM proxy's runtime config path (user_config_file_path)
+    2. CONFIG_FILE_PATH environment variable (LiteLLM standard)
+    3. LITELLM_CONFIG_PATH environment variable
+    4. config.yaml in current working directory
+    """
+    # 1. Try LiteLLM proxy's runtime config path
+    try:
+        from litellm.proxy.proxy_server import user_config_file_path
+
+        if user_config_file_path:
+            path = Path(user_config_file_path)
+            if path.exists():
+                return path
+    except ImportError:
+        logger.debug("LiteLLM proxy module not available")
+
+    # 2. Try LiteLLM's standard CONFIG_FILE_PATH env var
+    config_path = os.environ.get("CONFIG_FILE_PATH")
+    if config_path:
+        path = Path(config_path)
+        if path.exists():
+            return path
+
+    # 3. Try LITELLM_CONFIG_PATH env var
+    config_path = os.environ.get("LITELLM_CONFIG_PATH")
+    if config_path:
+        path = Path(config_path)
+        if path.exists():
+            return path
+
+    # 4. Try config files in current working directory
     candidates = [
         Path.cwd() / "config.yaml",
         Path.cwd() / "config.yml",
-        Path(os.environ.get("LITELLM_CONFIG_PATH", "")) if os.environ.get("LITELLM_CONFIG_PATH") else None,
     ]
 
     for candidate in candidates:
