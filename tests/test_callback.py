@@ -1,5 +1,6 @@
 """Unit tests for RateLimitCallback."""
 
+import asyncio
 from unittest.mock import MagicMock, Mock
 
 import pytest
@@ -99,16 +100,17 @@ class TestRateLimitCallback:
         cooldown_cache.add_deployment_to_cooldown = Mock()
         router = Mock()
         router.cooldown_cache = cooldown_cache
-        router.get_deployment = Mock(return_value=None)
+        router.model_list = []
         callback = RateLimitCallback()
         callback.set_router(router)
-        await callback._update_cooldown("claude-3-sonnet", 45.0)
+        await callback._update_cooldown("claude-3-sonnet", 45.0, {})
         cooldown_cache.add_deployment_to_cooldown.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_update_cooldown_no_router(self):
         callback = RateLimitCallback()
-        await callback._update_cooldown("claude-3-sonnet", 45.0)
+        callback.set_router(None)
+        await callback._update_cooldown("claude-3-sonnet", 45.0, {})
 
     @pytest.mark.asyncio
     async def test_update_cooldown_no_cache(self):
@@ -116,7 +118,7 @@ class TestRateLimitCallback:
         del router.cooldown_cache
         callback = RateLimitCallback()
         callback.set_router(router)
-        await callback._update_cooldown("claude-3-sonnet", 45.0)
+        await callback._update_cooldown("claude-3-sonnet", 45.0, {})
 
     def test_get_cooldown_for_model_default(self):
         callback = RateLimitCallback()
@@ -136,28 +138,51 @@ class TestRateLimitCallback:
         assert callback._get_cooldown_for_model("openai/gpt-4") == 60.0
         assert callback._get_cooldown_for_model("minimax-m2.5") == 30.0
 
-    def test_get_deployment_for_model_no_router(self):
+    def test_get_deployment_ids_for_model_no_router(self):
         callback = RateLimitCallback()
-        result = callback._get_deployment_for_model("claude-3-sonnet")
-        assert result is None
+        result = callback._get_deployment_ids_for_model("claude-3-sonnet")
+        assert result == []
 
-    def test_get_deployment_for_model_with_router(self):
+    def test_get_deployment_ids_for_model_with_dict_deployments(self):
         router = Mock()
-        deployment = Mock()
-        deployment.model_info = {"id": "deployment-123"}
-        router.get_deployment = Mock(return_value=deployment)
+        router.model_list = [
+            {"model_name": "claude-3-sonnet", "model_info": {"id": "dep-123"}},
+            {"model_name": "claude-3-opus", "model_info": {"id": "dep-456"}},
+            {"model_name": "claude-3-sonnet", "model_info": {"id": "dep-789"}},
+        ]
         callback = RateLimitCallback()
         callback.set_router(router)
-        result = callback._get_deployment_for_model("claude-3-sonnet")
-        assert result == "deployment-123"
+        result = callback._get_deployment_ids_for_model("claude-3-sonnet")
+        assert "dep-123" in result
+        assert "dep-789" in result
+        assert len(result) == 2
 
-    def test_get_deployment_for_model_deployment_not_found(self):
+    def test_get_deployment_ids_for_model_no_match(self):
         router = Mock()
-        router.get_deployment = Mock(side_effect=Exception("Not found"))
+        router.model_list = [
+            {"model_name": "claude-3-opus", "model_info": {"id": "dep-123"}},
+        ]
         callback = RateLimitCallback()
         callback.set_router(router)
-        result = callback._get_deployment_for_model("claude-3-sonnet")
-        assert result == "claude-3-sonnet"
+        result = callback._get_deployment_ids_for_model("claude-3-sonnet")
+        assert result == []
+
+    def test_get_model_names_from_router(self):
+        router = Mock()
+        router.model_list = [
+            {"model_name": "claude-3-sonnet"},
+            {"model_name": "claude-3-opus"},
+            {"model_name": "gpt-4"},
+        ]
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        result = callback._get_model_names_from_router()
+        assert result == ["claude-3-opus", "claude-3-sonnet", "gpt-4"]
+
+    def test_get_model_names_from_router_no_model_list(self):
+        callback = RateLimitCallback()
+        result = callback._get_model_names_from_router()
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_pre_call_hook_passes_healthy_model(self):
@@ -183,3 +208,23 @@ class TestRateLimitCallback:
             call_type="completion",
         )
         assert result == data
+
+    @pytest.mark.asyncio
+    async def test_set_router_starts_health_checks(self):
+        from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
+
+        benchmark = HealthBenchmark(test_prompt="Say 'ok'")
+        runner = HealthCheckRunner(benchmark=benchmark)
+
+        router = Mock()
+        router.model_list = [{"model_name": "claude-3-sonnet"}, {"model_name": "gpt-4"}]
+
+        callback = RateLimitCallback(
+            health_check_enabled=True,
+            health_check_interval_seconds=60,
+        )
+        callback._health_runner = runner
+
+        callback.set_router(router)
+
+        await asyncio.sleep(0.1)

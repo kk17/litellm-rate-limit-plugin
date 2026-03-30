@@ -81,6 +81,19 @@ class RateLimitCallback(CustomLogger):
         self._alias_state.set_router(router)
         logger.info("Router reference set")
 
+        if self._health_check_enabled and self._health_runner:
+            model_names = self._get_model_names_from_router()
+            if model_names:
+                asyncio.create_task(
+                    self._health_runner.start_periodic_checks(
+                        name="startup",
+                        models=model_names,
+                        interval_seconds=self._health_check_interval,
+                        health_manager=self._health_state,
+                    )
+                )
+                logger.info("Started startup health checks for %d models", len(model_names))
+
     async def async_pre_call_hook(
         self,
         user_api_key_dict: UserAPIKeyAuth,
@@ -134,7 +147,7 @@ class RateLimitCallback(CustomLogger):
         await self._alias_state.mark_rate_limited(model, cooldown_seconds)
 
         if self._router is not None:
-            await self._update_cooldown(model, cooldown_seconds)
+            await self._update_cooldown(model, cooldown_seconds, request_data)
 
     @staticmethod
     def _get_status_code(error: Exception) -> int | None:
@@ -150,38 +163,100 @@ class RateLimitCallback(CustomLogger):
             return self.provider_cooldown_seconds[prefix]
         return self.default_cooldown_seconds
 
-    async def _update_cooldown(self, model: str, cooldown_seconds: float) -> None:
+    async def _update_cooldown(self, model: str, cooldown_seconds: float, request_data: dict) -> None:
         if not hasattr(self._router, "cooldown_cache"):
             logger.debug("Router has no cooldown_cache attribute")
             return
 
         async with self._cooldown_cache_lock:
-            deployment = self._get_deployment_for_model(model)
-            if deployment is None:
-                deployment = model
+            deployment_id = request_data.get("litellm_params", {}).get("model_info", {}).get("id")
 
-            cooldown_cache = self._router.cooldown_cache
-            cooldown_cache.add_deployment_to_cooldown(
-                model_id=deployment,
-                original_exception=Exception("Rate limit detected"),
+            if deployment_id:
+                self._router.cooldown_cache.add_deployment_to_cooldown(
+                    model_id=deployment_id,
+                    original_exception=Exception("Error detected by rate limit plugin"),
+                    exception_status=429,
+                    cooldown_time=cooldown_seconds,
+                )
+                logger.info(
+                    "Set cooldown for deployment %s (model %s): %.1fs",
+                    deployment_id,
+                    model,
+                    cooldown_seconds,
+                )
+                return
+
+            deployment_ids = self._get_deployment_ids_for_model(model)
+            if deployment_ids:
+                for dep_id in deployment_ids:
+                    self._router.cooldown_cache.add_deployment_to_cooldown(
+                        model_id=dep_id,
+                        original_exception=Exception("Error detected by rate limit plugin"),
+                        exception_status=429,
+                        cooldown_time=cooldown_seconds,
+                    )
+                    logger.info(
+                        "Set cooldown for deployment %s (model %s): %.1fs",
+                        dep_id,
+                        model,
+                        cooldown_seconds,
+                    )
+                return
+
+            logger.warning(
+                "No deployment ID found for model %s, using model name as fallback",
+                model,
+            )
+            self._router.cooldown_cache.add_deployment_to_cooldown(
+                model_id=model,
+                original_exception=Exception("Error detected by rate limit plugin"),
                 exception_status=429,
                 cooldown_time=cooldown_seconds,
             )
-            logger.info("Set cooldown for deployment %s: %.1fs", deployment, cooldown_seconds)
+            logger.info(
+                "Set cooldown for model %s (fallback): %.1fs",
+                model,
+                cooldown_seconds,
+            )
 
-    def _get_deployment_for_model(self, model: str) -> str | None:
-        if self._router is None:
-            return None
+    def _get_deployment_ids_for_model(self, model_name: str) -> list[str]:
+        if not hasattr(self._router, "model_list"):
+            return []
 
-        if hasattr(self._router, "get_deployment"):
-            try:
-                deployment = self._router.get_deployment(model_id=model)
-                if deployment and hasattr(deployment, "model_info"):
-                    return deployment.model_info.get("id", model)
-            except Exception as e:
-                logger.debug("Could not get deployment for model %s: %s", model, e)
+        ids = []
+        for deployment in self._router.model_list:
+            dep_model_name = (
+                deployment.get("model_name")
+                if isinstance(deployment, dict)
+                else getattr(deployment, "model_name", None)
+            )
+            if dep_model_name == model_name:
+                model_info = (
+                    deployment.get("model_info", {})
+                    if isinstance(deployment, dict)
+                    else getattr(deployment, "model_info", {})
+                )
+                dep_id = (
+                    model_info.get("id") if isinstance(model_info, dict) else getattr(model_info, "id", None)
+                )
+                if dep_id:
+                    ids.append(dep_id)
+        return ids
 
-        return model
+    def _get_model_names_from_router(self) -> list[str]:
+        if not hasattr(self._router, "model_list"):
+            return []
+
+        names = set()
+        for deployment in self._router.model_list:
+            model_name = (
+                deployment.get("model_name")
+                if isinstance(deployment, dict)
+                else getattr(deployment, "model_name", None)
+            )
+            if model_name:
+                names.add(model_name)
+        return sorted(names)
 
     async def start_health_checks(self, models: list[str]) -> None:
         if not self._health_runner:

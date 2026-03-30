@@ -66,6 +66,7 @@ def pytest_collection_modifyitems(config, items):
 
 class MockAPIHandler(BaseHTTPRequestHandler):
     rate_limited_models: set = set()
+    no_quota_models: set = set()
     call_counts: dict = {}
     protocol_version = "HTTP/1.1"
 
@@ -79,6 +80,23 @@ class MockAPIHandler(BaseHTTPRequestHandler):
         model = data.get("model", "unknown")
 
         self.__class__.call_counts[model] = self.__class__.call_counts.get(model, 0) + 1
+
+        if model in self.__class__.no_quota_models:
+            response_body = json.dumps(
+                {
+                    "error": {
+                        "message": "You have no quota",
+                        "type": "quota_error",
+                        "code": "no_quota",
+                    }
+                }
+            ).encode()
+            self.send_response(402)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(response_body))
+            self.end_headers()
+            self.wfile.write(response_body)
+            return
 
         if model in self.__class__.rate_limited_models:
             response_body = json.dumps(
@@ -180,6 +198,48 @@ rate_limit_plugin:
     openai: ["gpt-4o-mini"]
 """
 
+_CONFIG_TEMPLATE_FALLBACK = """
+general_settings:
+  master_key: test-master-key
+
+model_list:
+  - model_name: primary-model
+    litellm_params:
+      model: openai/primary-model
+      api_key: sk-test-key
+      api_base: http://localhost:8765
+      num_retries: 0
+      request_timeout: 10
+      allowed_fails: 100
+      health_check: false
+
+  - model_name: fallback-model
+    litellm_params:
+      model: openai/fallback-model
+      api_key: sk-test-key
+      api_base: http://localhost:8765
+      num_retries: 0
+      request_timeout: 10
+      allowed_fails: 100
+      health_check: false
+
+litellm_settings:
+  callbacks: ["callback_for_test.rate_limit_callback"]
+  num_retries: 0
+  enable_pre_call_checks: true
+
+router_settings:
+  fallbacks:
+    - primary-model:
+        - fallback-model
+
+rate_limit_plugin:
+  default_cooldown_seconds: 2
+  provider_cooldown_seconds:
+    github-copilot: 300
+    minimax: 30
+"""
+
 
 def _write_config(config_dir: Path) -> Path:
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -187,6 +247,15 @@ def _write_config(config_dir: Path) -> Path:
     shutil.copy(callback_src, config_dir / "callback_for_test.py")
     config_path = config_dir / "config.yaml"
     config_path.write_text(_CONFIG_TEMPLATE)
+    return config_path
+
+
+def _write_config_fallback(config_dir: Path) -> Path:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    callback_src = Path(__file__).parent / "callback_for_test.py"
+    shutil.copy(callback_src, config_dir / "callback_for_test.py")
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(_CONFIG_TEMPLATE_FALLBACK)
     return config_path
 
 
@@ -273,6 +342,18 @@ def per_test_proxy(tmp_path, mock_api_server):
     """
     port = next(_port_counter)
     config_path = _write_config(tmp_path / "litellm_config")
+    proc = _start_proxy(config_path, port)
+    yield {
+        "base_url": f"http://localhost:{port}",
+        "process": proc,
+    }
+    _stop_proxy(proc)
+
+
+@pytest.fixture
+def per_test_proxy_with_fallback(tmp_path, mock_api_server):
+    port = next(_port_counter)
+    config_path = _write_config_fallback(tmp_path / "litellm_config_fallback")
     proc = _start_proxy(config_path, port)
     yield {
         "base_url": f"http://localhost:{port}",
