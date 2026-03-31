@@ -228,3 +228,121 @@ class TestRateLimitCallback:
         callback.set_router(router)
 
         await asyncio.sleep(0.1)
+
+        assert runner.is_running("startup"), (
+            "Health check task 'startup' should be running after set_router()"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ensure_router_starts_health_checks_lazily(self):
+        from unittest.mock import patch
+
+        from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
+
+        benchmark = HealthBenchmark(test_prompt="Say 'ok'")
+        runner = HealthCheckRunner(benchmark=benchmark)
+
+        mock_router = Mock()
+        mock_router.model_list = [{"model_name": "claude-3-sonnet"}]
+
+        callback = RateLimitCallback(
+            health_check_enabled=True,
+            health_check_interval_seconds=60,
+        )
+        callback._health_runner = runner
+        assert callback._health_checks_started is False
+
+        with patch("litellm.proxy.proxy_server.llm_router", mock_router):
+            router = callback._ensure_router()
+
+        assert router is mock_router
+        assert callback._health_checks_started is True
+
+        await asyncio.sleep(0.1)
+
+        assert runner.is_running("startup")
+
+    @pytest.mark.asyncio
+    async def test_pre_call_hook_starts_health_checks_on_first_request(self):
+        from unittest.mock import patch
+
+        from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
+
+        benchmark = HealthBenchmark(test_prompt="Say 'ok'")
+        runner = HealthCheckRunner(benchmark=benchmark)
+
+        mock_router = Mock()
+        mock_router.model_list = [{"model_name": "gpt-4"}]
+
+        callback = RateLimitCallback(
+            health_check_enabled=True,
+            health_check_interval_seconds=60,
+        )
+        callback._health_runner = runner
+
+        assert callback._health_checks_started is False
+        assert callback._router is None
+
+        with patch("litellm.proxy.proxy_server.llm_router", mock_router):
+            data = {"model": "gpt-4"}
+            result = await callback.async_pre_call_hook(
+                user_api_key_dict=Mock(),
+                cache=Mock(),
+                data=data,
+                call_type="completion",
+            )
+
+        assert result == data
+        assert callback._health_checks_started is True
+        assert callback._router is mock_router
+
+        await asyncio.sleep(0.2)
+
+        assert runner.is_running("startup"), (
+            "Health checks should start when _ensure_router() obtains the router"
+        )
+
+    @pytest.mark.asyncio
+    async def test_log_failure_event_triggers_cooldown(self):
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+        error = Mock()
+        error.status_code = 402
+        kwargs = {"model": "claude-3-sonnet", "exception": error}
+        await callback.async_log_failure_event(
+            kwargs=kwargs, response_obj=None, start_time=None, end_time=None
+        )
+        is_limited = await callback._alias_state.is_rate_limited("claude-3-sonnet")
+        assert is_limited is True
+
+    @pytest.mark.asyncio
+    async def test_log_failure_event_no_exception_skips(self):
+        callback = RateLimitCallback()
+        kwargs = {"model": "claude-3-sonnet"}
+        await callback.async_log_failure_event(
+            kwargs=kwargs, response_obj=None, start_time=None, end_time=None
+        )
+        is_limited = await callback._alias_state.is_rate_limited("claude-3-sonnet")
+        assert is_limited is False
+
+    @pytest.mark.asyncio
+    async def test_log_failure_event_401_skipped(self):
+        callback = RateLimitCallback()
+        error = Mock()
+        error.status_code = 401
+        kwargs = {"model": "claude-3-sonnet", "exception": error}
+        await callback.async_log_failure_event(
+            kwargs=kwargs, response_obj=None, start_time=None, end_time=None
+        )
+        is_limited = await callback._alias_state.is_rate_limited("claude-3-sonnet")
+        assert is_limited is False
+
+    @pytest.mark.asyncio
+    async def test_log_failure_event_rate_limit_with_headers(self):
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+        error = type("Error", (), {"status_code": 429, "headers": {"retry-after": "30"}})()
+        kwargs = {"model": "claude-3-sonnet", "exception": error}
+        await callback.async_log_failure_event(
+            kwargs=kwargs, response_obj=None, start_time=None, end_time=None
+        )
+        is_limited = await callback._alias_state.is_rate_limited("claude-3-sonnet")
+        assert is_limited is True

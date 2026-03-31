@@ -110,6 +110,136 @@ class TestHealthBenchmark:
         assert result.status == HealthStatus.UNHEALTHY
         assert "exceeds max" in result.error
 
+    @pytest.mark.asyncio
+    async def test_run_health_check_error_response_dict(self):
+        benchmark = HealthBenchmark()
+
+        async def error_client(model_id: str, prompt: str):
+            return {"error": {"message": "Usage limit reached", "code": "quota_exceeded"}}
+
+        result = await benchmark.run_health_check("grok-code-fast-1", client=error_client)
+
+        assert result.status == HealthStatus.UNHEALTHY
+        assert result.response_valid is False
+        assert "Usage limit reached" in result.error
+
+    @pytest.mark.asyncio
+    async def test_run_health_check_error_response_object(self):
+        benchmark = HealthBenchmark()
+
+        class MockResponse:
+            def __init__(self):
+                self.error = {"message": "No quota", "type": "insufficient_quota"}
+
+        async def error_client(model_id: str, prompt: str):
+            return MockResponse()
+
+        result = await benchmark.run_health_check("grok-code-fast-1", client=error_client)
+
+        assert result.status == HealthStatus.UNHEALTHY
+        assert result.response_valid is False
+        assert "No quota" in result.error
+
+    @pytest.mark.asyncio
+    async def test_run_health_check_error_status_code(self):
+        benchmark = HealthBenchmark()
+
+        class MockResponse:
+            def __init__(self):
+                self.status_code = 402
+
+        async def error_client(model_id: str, prompt: str):
+            return MockResponse()
+
+        result = await benchmark.run_health_check("grok-code-fast-1", client=error_client)
+
+        assert result.status == HealthStatus.UNHEALTHY
+        assert result.response_valid is False
+        assert "402" in result.error
+
+    @pytest.mark.asyncio
+    async def test_run_health_check_success_response(self):
+        benchmark = HealthBenchmark()
+
+        async def success_client(model_id: str, prompt: str):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        result = await benchmark.run_health_check("gpt-4o", client=success_client)
+
+        assert result.status == HealthStatus.HEALTHY
+        assert result.response_valid is True
+
+
+class TestIsErrorResponse:
+    def test_clean_dict_response(self):
+        from litellm_rate_limit.health_checker import _is_error_response
+
+        is_err, msg = _is_error_response({"choices": [{"message": {"content": "ok"}}]})
+        assert is_err is False
+
+    def test_error_dict_with_message(self):
+        from litellm_rate_limit.health_checker import _is_error_response
+
+        is_err, msg = _is_error_response({"error": {"message": "Rate limit", "type": "rate_limit_error"}})
+        assert is_err is True
+        assert "Rate limit" in msg
+
+    def test_error_dict_string(self):
+        from litellm_rate_limit.health_checker import _is_error_response
+
+        is_err, msg = _is_error_response({"error": "something went wrong"})
+        assert is_err is True
+        assert "something went wrong" in msg
+
+    def test_object_with_error_attr(self):
+        from litellm_rate_limit.health_checker import _is_error_response
+
+        class Obj:
+            error = {"message": "quota exceeded"}
+
+        is_err, msg = _is_error_response(Obj())
+        assert is_err is True
+        assert "quota exceeded" in msg
+
+    def test_object_with_error_string(self):
+        from litellm_rate_limit.health_checker import _is_error_response
+
+        class Obj:
+            error = "Not found"
+
+        is_err, msg = _is_error_response(Obj())
+        assert is_err is True
+        assert "Not found" in msg
+
+    def test_object_with_status_code_200(self):
+        from litellm_rate_limit.health_checker import _is_error_response
+
+        class Obj:
+            status_code = 200
+
+        is_err, msg = _is_error_response(Obj())
+        assert is_err is False
+
+    def test_object_with_status_code_402(self):
+        from litellm_rate_limit.health_checker import _is_error_response
+
+        class Obj:
+            status_code = 402
+
+        is_err, msg = _is_error_response(Obj())
+        assert is_err is True
+        assert "402" in msg
+
+    def test_object_with_status_code_500(self):
+        from litellm_rate_limit.health_checker import _is_error_response
+
+        class Obj:
+            status_code = 500
+
+        is_err, msg = _is_error_response(Obj())
+        assert is_err is True
+        assert "500" in msg
+
 
 class TestHealthCheckRunner:
     def test_health_check_runner_init(self):

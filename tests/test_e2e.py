@@ -253,6 +253,9 @@ class TestMockProxyBasicFlow:
             user_api_key_dict=mock_user_auth,
         )
 
+        is_limited = await callback._alias_state.is_rate_limited("gpt-4")
+        assert is_limited is True
+
         result = await callback.async_pre_call_hook(
             user_api_key_dict=mock_user_auth,
             cache=mock_cache,

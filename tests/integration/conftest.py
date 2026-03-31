@@ -269,17 +269,26 @@ def _find_litellm_bin() -> Path:
     return litellm_bin
 
 
-def _start_proxy(config_path: Path, port: int) -> subprocess.Popen:
+def _start_proxy(config_path: Path, port: int, log_file: Path | None = None) -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).parent.parent.parent / "src")
 
-    proc = subprocess.Popen(
-        [str(_find_litellm_bin()), "--config", str(config_path), "--port", str(port)],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    if log_file:
+        proc = subprocess.Popen(
+            [str(_find_litellm_bin()), "--config", str(config_path), "--port", str(port)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    else:
+        proc = subprocess.Popen(
+            [str(_find_litellm_bin()), "--config", str(config_path), "--port", str(port)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
     max_wait = 60
     start_time = time.time()
@@ -354,9 +363,11 @@ def per_test_proxy(tmp_path, mock_api_server):
 def per_test_proxy_with_fallback(tmp_path, mock_api_server):
     port = next(_port_counter)
     config_path = _write_config_fallback(tmp_path / "litellm_config_fallback")
-    proc = _start_proxy(config_path, port)
+    log_file = tmp_path / "proxy_fallback.log"
+    proc = _start_proxy(config_path, port, log_file=log_file)
     yield {
         "base_url": f"http://localhost:{port}",
         "process": proc,
+        "log_file": log_file,
     }
     _stop_proxy(proc)

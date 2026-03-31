@@ -2,6 +2,9 @@
 
 import asyncio
 import logging
+import threading
+import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from litellm.integrations.custom_logger import CustomLogger
@@ -9,9 +12,10 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.utils import DualCache
 
 from litellm_rate_limit.alias_aware_state import AliasAwareHealthState
+from litellm_rate_limit.config import RateLimitPluginConfig
 from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
 from litellm_rate_limit.health_state import HealthStateManager
-from litellm_rate_limit.parser import extract_rate_limit_reset_seconds, is_rate_limit_error
+from litellm_rate_limit.parser import detect_api_error, extract_rate_limit_reset_seconds, is_rate_limit_error
 from litellm_rate_limit.provider_probe import ProviderProbeConfig, _extract_model_prefix
 
 if TYPE_CHECKING:
@@ -23,7 +27,7 @@ logger = logging.getLogger(__name__)
 class RateLimitCallback(CustomLogger):
     """LiteLLM callback that intercepts API errors and blocks unhealthy models.
 
-    Handles 429 rate limits with header-parsed reset times, and all other API
+    Handles 429 rate limits with header-parsed reset times and all other API
     errors (except 401/403) with per-provider or default cooldown.
     """
 
@@ -54,6 +58,22 @@ class RateLimitCallback(CustomLogger):
         self._health_check_enabled = health_check_enabled
         self._health_check_interval = health_check_interval_seconds
         self._health_runner: HealthCheckRunner | None = None
+        self._health_checks_started = False
+        self._startup_models: list[str] | None = None
+        self._startup_thread: threading.Thread | None = None
+
+        health_logger = logging.getLogger("litellm_rate_limit.health_checker")
+        provider_logger = logging.getLogger("litellm_rate_limit.provider_probe")
+
+        plugin_logger = logging.getLogger("litellm_rate_limit")
+        if not plugin_logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(levelname)s - %(name)s - %(message)s"))
+            plugin_logger.addHandler(handler)
+        plugin_logger.setLevel(logging.DEBUG)
+
+        for lg in (logger, health_logger, provider_logger):
+            lg.setLevel(logging.DEBUG)
 
         if health_check_enabled:
             benchmark = HealthBenchmark(
@@ -61,12 +81,7 @@ class RateLimitCallback(CustomLogger):
                 max_latency_ms=health_check_max_latency_ms,
             )
             self._health_runner = HealthCheckRunner(benchmark=benchmark)
-
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter("%(levelname)s - %(name)s - %(message)s"))
-            logger.addHandler(handler)
-            logger.setLevel(logging.INFO)
+            self._start_router_poll_thread()
 
         logger.info(
             "RateLimitCallback initialized: cooldown=%.1fs, provider_cooldown=%s, health_check=%s, probe_config=%s",
@@ -76,23 +91,103 @@ class RateLimitCallback(CustomLogger):
             bool(probe_models_by_provider),
         )
 
+    @classmethod
+    def from_config(cls, config: RateLimitPluginConfig) -> "RateLimitCallback":
+        return cls(
+            default_cooldown_seconds=config.default_cooldown_seconds,
+            provider_cooldown_seconds=config.provider_cooldown_seconds,
+            probe_models_by_provider=config.health_check.probe_models_by_provider,
+            health_check_enabled=config.health_check.enabled,
+            health_check_interval_seconds=config.health_check.interval_seconds,
+            health_check_prompt=config.health_check.test_prompt,
+            health_check_max_latency_ms=config.health_check.max_latency_ms,
+        )
+
+    def _start_router_poll_thread(self) -> None:
+        def poll_for_router():
+            for _ in range(60):
+                if self._health_checks_started:
+                    return
+                try:
+                    from litellm.proxy.proxy_server import llm_router
+
+                    if llm_router is not None:
+                        logger.info("Router detected via poll thread, starting health checks")
+                        self._router = llm_router
+                        self._alias_state.set_router(llm_router)
+
+                        if self._probe_config and hasattr(llm_router, "model_list"):
+                            self._probe_config.build_from_router(llm_router.model_list)
+                            logger.info("Built probe config from router model_list")
+
+                        model_names = self._get_model_names_from_router()
+                        if model_names:
+                            self._health_checks_started = True
+                            try:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                loop.run_until_complete(
+                                    self._run_initial_checks_and_start_periodic(model_names)
+                                )
+                                loop.close()
+                            except Exception as e:
+                                logger.error("Failed to run startup health checks: %s", e)
+                        return
+                except ImportError:
+                    pass
+                time.sleep(0.5)
+            logger.warning("Router poll thread timed out waiting for router")
+
+        self._startup_thread = threading.Thread(target=poll_for_router, daemon=True)
+        self._startup_thread.start()
+        logger.info("Started router poll thread for startup health checks")
+
     def set_router(self, router: "LiteLLMRouter") -> None:
         self._router = router
         self._alias_state.set_router(router)
         logger.info("Router reference set")
 
-        if self._health_check_enabled and self._health_runner:
+        if self._probe_config and hasattr(router, "model_list"):
+            self._probe_config.build_from_router(router.model_list)
+            logger.info("Built probe config from router model_list")
+
+        if self._health_check_enabled and self._health_runner and not self._health_checks_started:
             model_names = self._get_model_names_from_router()
             if model_names:
-                asyncio.create_task(
-                    self._health_runner.start_periodic_checks(
-                        name="startup",
-                        models=model_names,
-                        interval_seconds=self._health_check_interval,
-                        health_manager=self._health_state,
-                    )
-                )
-                logger.info("Started startup health checks for %d models", len(model_names))
+                self._health_checks_started = True
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._run_initial_checks_and_start_periodic(model_names))
+                    logger.info("Scheduled startup health checks for %d models", len(model_names))
+                except RuntimeError:
+                    self._startup_models = model_names
+                    logger.info("No event loop, deferring startup health checks to first request")
+
+    async def _run_initial_checks_and_start_periodic(self, model_names: list[str]) -> None:
+        if self._health_runner is None:
+            logger.warning("Health runner not initialized, skipping startup health checks")
+            return
+        if not model_names:
+            logger.warning("No models to health check at startup")
+            return
+
+        models_to_check = (
+            self._probe_config.get_models_to_health_check(model_names) if self._probe_config else model_names
+        )
+        logger.info(
+            "Running startup health checks for %d models (reduced from %d via probe config)",
+            len(models_to_check),
+            len(model_names),
+        )
+        client = self._get_health_check_client()
+        await self._health_runner.run_initial_checks_and_start_periodic(
+            models=models_to_check,
+            interval_seconds=self._health_check_interval,
+            health_manager=self._health_state,
+            client=client,
+            cooldown_seconds=self.default_cooldown_seconds,
+        )
+        logger.info("Completed startup health checks for %d models", len(models_to_check))
 
     async def async_pre_call_hook(
         self,
@@ -103,6 +198,19 @@ class RateLimitCallback(CustomLogger):
     ) -> dict:
         model = data.get("model", "")
         logger.debug("Pre-call hook for model %s", model)
+
+        self._ensure_router()
+
+        if self._startup_models:
+            models = self._startup_models
+            self._startup_models = None
+            logger.info("Triggering startup health checks for %d models", len(models))
+            await self._run_initial_checks_and_start_periodic(models)
+
+        if await self._health_state.is_rate_limited(model):
+            logger.info("Model %s is rate-limited, adding to cooldown cache", model)
+            await self._sync_health_state_to_cooldown(model)
+
         return data
 
     async def async_post_call_failure_hook(
@@ -112,50 +220,99 @@ class RateLimitCallback(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth | None = None,
         traceback_str: str | None = None,
     ) -> None:
-        logger.debug(
-            "Post-failure hook called: exception=%s",
-            type(original_exception).__name__,
+        await self._handle_deployment_failure(
+            exception=original_exception,
+            model=request_data.get("model", "unknown"),
+            request_data=request_data,
         )
 
-        status_code = self._get_status_code(original_exception)
-
-        if status_code in self._SKIP_STATUS_CODES:
-            logger.debug("Auth/permission error (%s), skipping", status_code)
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time) -> None:
+        exception = kwargs.get("exception")
+        if exception is None:
             return
 
-        if status_code is None:
-            logger.debug("No status code on exception, skipping")
+        model = kwargs.get("model", "unknown")
+        await self._handle_deployment_failure(
+            exception=exception,
+            model=model,
+            request_data=kwargs,
+        )
+
+    def _ensure_router(self) -> "LiteLLMRouter | None":
+        if self._router is not None:
+            return self._router
+        try:
+            from litellm.proxy.proxy_server import llm_router
+
+            if llm_router is not None:
+                self._router = llm_router
+                self._alias_state.set_router(llm_router)
+                logger.info("Router reference obtained from proxy global")
+
+                if self._probe_config and hasattr(llm_router, "model_list"):
+                    self._probe_config.build_from_router(llm_router.model_list)
+                    logger.info("Built probe config from router model_list")
+
+                if self._health_check_enabled and self._health_runner and not self._health_checks_started:
+                    model_names = self._get_model_names_from_router()
+                    if model_names:
+                        self._health_checks_started = True
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(self._run_initial_checks_and_start_periodic(model_names))
+                            logger.info(
+                                "Auto-started health checks for %d models via _ensure_router",
+                                len(model_names),
+                            )
+                        except RuntimeError:
+                            self._startup_models = model_names
+                            logger.info("No event loop, deferring health checks to first request")
+        except ImportError:
+            pass
+        return self._router
+
+    async def _handle_deployment_failure(
+        self, exception: Exception, model: str, request_data: dict | None = None
+    ) -> None:
+        detected = detect_api_error(exception)
+        if detected is not None:
+            is_err, status_code, _ = detected
+            if status_code in self._SKIP_STATUS_CODES:
+                logger.debug("Auth/permission error (%s), skipping", status_code)
+                return
+        else:
+            logger.debug("No error detected from exception, skipping")
             return
 
-        model = request_data.get("model", "unknown")
+        status_code = None
+        if detected:
+            _, status_code, _ = detected
 
-        if is_rate_limit_error(original_exception):
+        if is_rate_limit_error(exception):
             cooldown_seconds = extract_rate_limit_reset_seconds(
-                original_exception,
+                exception,
                 default=self._get_cooldown_for_model(model),
             )
+            from litellm_rate_limit.parser import extract_rate_limit_reset_dt
+
+            reset_at = extract_rate_limit_reset_dt(exception)
         else:
             cooldown_seconds = self._get_cooldown_for_model(model)
+            reset_at = None
 
         logger.info(
-            "Marking model %s unhealthy for %.1f seconds (status=%s)",
+            "Marking model %s unhealthy for %.1f seconds (status=%s, exception=%s)",
             model,
             cooldown_seconds,
             status_code,
+            type(exception).__name__,
         )
 
-        await self._alias_state.mark_rate_limited(model, cooldown_seconds)
+        await self._alias_state.mark_rate_limited(model, cooldown_seconds, reset_at=reset_at)
 
-        if self._router is not None:
+        router = self._ensure_router()
+        if router is not None:
             await self._update_cooldown(model, cooldown_seconds, request_data)
-
-    @staticmethod
-    def _get_status_code(error: Exception) -> int | None:
-        if hasattr(error, "status_code") and isinstance(error.status_code, int):
-            return error.status_code
-        if hasattr(error, "response") and hasattr(error.response, "status_code"):
-            return error.response.status_code
-        return None
 
     def _get_cooldown_for_model(self, model: str) -> float:
         prefix = _extract_model_prefix(model)
@@ -163,13 +320,17 @@ class RateLimitCallback(CustomLogger):
             return self.provider_cooldown_seconds[prefix]
         return self.default_cooldown_seconds
 
-    async def _update_cooldown(self, model: str, cooldown_seconds: float, request_data: dict) -> None:
+    async def _update_cooldown(
+        self, model: str, cooldown_seconds: float, request_data: dict | None = None
+    ) -> None:
         if not hasattr(self._router, "cooldown_cache"):
             logger.debug("Router has no cooldown_cache attribute")
             return
 
         async with self._cooldown_cache_lock:
-            deployment_id = request_data.get("litellm_params", {}).get("model_info", {}).get("id")
+            deployment_id = None
+            if request_data is not None:
+                deployment_id = request_data.get("litellm_params", {}).get("model_info", {}).get("id")
 
             if deployment_id:
                 self._router.cooldown_cache.add_deployment_to_cooldown(
@@ -219,6 +380,40 @@ class RateLimitCallback(CustomLogger):
                 cooldown_seconds,
             )
 
+    async def _sync_health_state_to_cooldown(self, model: str) -> None:
+        if self._router is None or not hasattr(self._router, "cooldown_cache"):
+            return
+
+        cooldown_seconds = self._get_cooldown_for_model(model)
+
+        deployment_ids = self._get_deployment_ids_for_model(model)
+        if deployment_ids:
+            for dep_id in deployment_ids:
+                self._router.cooldown_cache.add_deployment_to_cooldown(
+                    model_id=dep_id,
+                    original_exception=Exception("Model rate-limited by health check"),
+                    exception_status=429,
+                    cooldown_time=cooldown_seconds,
+                )
+                logger.info(
+                    "Synced health state to cooldown for deployment %s (model %s): %.1fs",
+                    dep_id,
+                    model,
+                    cooldown_seconds,
+                )
+        else:
+            self._router.cooldown_cache.add_deployment_to_cooldown(
+                model_id=model,
+                original_exception=Exception("Model rate-limited by health check"),
+                exception_status=429,
+                cooldown_time=cooldown_seconds,
+            )
+            logger.info(
+                "Synced health state to cooldown for model %s (fallback): %.1fs",
+                model,
+                cooldown_seconds,
+            )
+
     def _get_deployment_ids_for_model(self, model_name: str) -> list[str]:
         if not hasattr(self._router, "model_list"):
             return []
@@ -244,9 +439,8 @@ class RateLimitCallback(CustomLogger):
         return ids
 
     def _get_model_names_from_router(self) -> list[str]:
-        if not hasattr(self._router, "model_list"):
+        if self._router is None:
             return []
-
         names = set()
         for deployment in self._router.model_list:
             model_name = (
@@ -258,18 +452,42 @@ class RateLimitCallback(CustomLogger):
                 names.add(model_name)
         return sorted(names)
 
+    def _get_models_to_health_check(self, all_models: list[str]) -> list[str]:
+        if not all_models:
+            return []
+
+        if not self._probe_config or not self._probe_config.probe_models_by_provider:
+            return all_models
+
+        return self._probe_config.get_models_to_health_check(all_models)
+
+    def _get_health_check_client(self) -> Callable:
+        router = self._router
+
+        async def client(model_id: str, prompt: str):
+            if router is None:
+                raise RuntimeError("Router not set, cannot run health check")
+            return await router.acompletion(
+                model=model_id,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+        return client
+
     async def start_health_checks(self, models: list[str]) -> None:
         if not self._health_runner:
             logger.warning("Health checker not enabled")
             return
 
+        client = self._get_health_check_client()
         await self._health_runner.start_periodic_checks(
             name="default",
             models=models,
             interval_seconds=self._health_check_interval,
             health_manager=self._health_state,
+            client=client,
+            cooldown_seconds=self.default_cooldown_seconds,
         )
-        logger.info("Started health checks for %d models", len(models))
 
     async def stop_health_checks(self) -> None:
         if self._health_runner:

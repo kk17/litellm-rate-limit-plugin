@@ -54,6 +54,12 @@ A LiteLLM Proxy plugin providing intelligent health checking and rate limit hand
 
 **Hooks Used**:
 - `async_post_call_failure_hook` - Detect 429, extract reset time, update cooldown
+- `async_pre_call_hook` - Filter out rate-limited models before routing
+
+**Router Initialization**:
+- `_ensure_router()` lazily obtains router from `litellm.proxy.proxy_server.llm_router`
+- **Auto-starts health checks** when router is first obtained (idempotent via `_health_checks_started` flag)
+- No explicit `set_router()` call required - plugin self-initializes on first hook invocation
 
 **Integration Point**: Updates `router.cooldown_cache` with precise TTL.
 
@@ -234,8 +240,8 @@ if not hasattr(router, 'cooldown_cache'):
 ### With LiteLLM Router
 
 ```python
-# Get router reference
-callback.set_router(litellm_router)
+# Router reference is obtained lazily via _ensure_router()
+# No explicit set_router() call needed - plugin auto-initializes
 
 # Access cooldown cache
 router.cooldown_cache.set_cooldown(model_id, cooldown_time)
@@ -243,6 +249,8 @@ router.cooldown_cache.set_cooldown(model_id, cooldown_time)
 # Access alias mapping
 router.model_group_alias.get(alias_name, default)
 ```
+
+**Health Check Auto-Start**: When `_ensure_router()` first obtains the router reference, it automatically starts health checks if enabled. This is idempotent - multiple calls won't start duplicate health checks.
 
 ### With Custom Logger Base
 

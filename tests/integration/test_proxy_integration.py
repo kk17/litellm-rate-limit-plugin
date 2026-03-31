@@ -108,6 +108,81 @@ class TestRateLimitHandling:
             assert "choices" in data
 
 
+class TestRateLimitWithFallback:
+    @pytest.mark.integration
+    def test_429_triggers_cooldown_and_fallback(
+        self, per_test_proxy_with_fallback, api_key, mock_api_control
+    ):
+        """Test that 429 rate limit error triggers cooldown and fallback to healthy model."""
+        mock_api_control.rate_limited_models.add("primary-model")
+
+        status, body = curl_post(
+            f"{per_test_proxy_with_fallback['base_url']}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json_data={
+                "model": "primary-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+            timeout=30,
+        )
+        assert status == 200, f"Expected fallback to succeed, got {status}: {body}"
+        data = json.loads(body)
+        assert "choices" in data
+        # Should have fallen back to fallback-model
+        assert data["model"] == "fallback-model", f"Expected fallback-model, got {data.get('model')}"
+
+    @pytest.mark.integration
+    def test_429_second_request_skips_rate_limited_model(
+        self, per_test_proxy_with_fallback, api_key, mock_api_control
+    ):
+        """Test that after 429, subsequent requests skip the rate-limited model entirely."""
+        mock_api_control.rate_limited_models.add("primary-model")
+        mock_api_control.call_counts.clear()
+
+        # First request - should fail on primary, succeed on fallback
+        status, body = curl_post(
+            f"{per_test_proxy_with_fallback['base_url']}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json_data={
+                "model": "primary-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+            timeout=30,
+        )
+        assert status == 200
+        data = json.loads(body)
+        assert data["model"] == "fallback-model"
+
+        # Second request - should go directly to fallback, not even try primary
+        status2, body2 = curl_post(
+            f"{per_test_proxy_with_fallback['base_url']}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json_data={
+                "model": "primary-model",
+                "messages": [{"role": "user", "content": "Hello again"}],
+            },
+            timeout=30,
+        )
+        assert status2 == 200, f"Second request should succeed via fallback, got {status2}: {body2}"
+
+        # Primary should only be called once (first request that failed)
+        primary_calls = mock_api_control.call_counts.get("primary-model", 0)
+        fallback_calls = mock_api_control.call_counts.get("fallback-model", 0)
+
+        log_file = per_test_proxy_with_fallback.get("log_file")
+        log_content = ""
+        if log_file and log_file.exists():
+            log_content = log_file.read_text()
+
+        assert primary_calls == 1, (
+            f"Primary should be called once (first failed request), got {primary_calls}.\n"
+            f"Fallback calls: {fallback_calls}\n"
+            f"All call counts: {dict(mock_api_control.call_counts)}\n"
+            f"Proxy log (last 100 lines):\n{''.join(log_content.splitlines(keepends=True)[-100:])}"
+        )
+        assert fallback_calls >= 2, f"Fallback should be called at least twice, got {fallback_calls}"
+
+
 class TestNoQuotaFallback:
     @pytest.mark.integration
     def test_402_triggers_cooldown_and_fallback(
@@ -159,4 +234,17 @@ class TestNoQuotaFallback:
         assert status2 == 200, f"Second request should succeed via fallback, got {status2}: {body2}"
 
         fallback_calls = mock_api_control.call_counts.get("fallback-model", 0)
+        primary_calls = mock_api_control.call_counts.get("primary-model", 0)
+
+        log_file = per_test_proxy_with_fallback.get("log_file")
+        log_content = ""
+        if log_file and log_file.exists():
+            log_content = log_file.read_text()
+
+        assert primary_calls == 1, (
+            f"Primary should be called once (first request), got {primary_calls}.\n"
+            f"Fallback calls: {fallback_calls}\n"
+            f"All call counts: {dict(mock_api_control.call_counts)}\n"
+            f"Proxy log (last 100 lines):\n{''.join(log_content.splitlines(keepends=True)[-100:])}"
+        )
         assert fallback_calls >= 1, f"Fallback model should be called, got {fallback_calls}"

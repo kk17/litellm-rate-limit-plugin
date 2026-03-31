@@ -92,6 +92,13 @@ class AliasAwareHealthState:
                 return True
             return False
 
+    def get_rate_limit_until(self, model_name: str) -> datetime | None:
+        target = self._resolve_to_target(model_name)
+        entry = self._rate_limited_targets.get(target)
+        if entry is None:
+            return None
+        return entry.reset_at
+
     async def get_all_rate_limited(self) -> dict[str, RateLimitEntry]:
         now = time.monotonic()
         async with self._lock:

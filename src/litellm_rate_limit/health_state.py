@@ -100,6 +100,11 @@ class HealthStateManager:
 
             return True
 
+    def get_rate_limit_until(self, model_id: str) -> datetime | None:
+        effective_model = self._get_effective_model(model_id)
+        reset_at = self._rate_limit_reset_at.get(effective_model)
+        return reset_at
+
     async def get_healthy_models(self, all_models: list[str]) -> list[str]:
         healthy = []
         for model in all_models:

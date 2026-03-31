@@ -37,14 +37,6 @@ DEPLOYMENT - Bridge File Pattern (REQUIRED):
 from litellm_rate_limit import RateLimitCallback
 from litellm_rate_limit.config import load_config
 
-_config = load_config()
-
-rate_limit_callback = RateLimitCallback(
-    default_cooldown_seconds=_config["default_cooldown_seconds"],
-    provider_cooldown_seconds=_config.get("provider_cooldown_seconds"),
-    probe_models_by_provider=_config.get("probe_models_by_provider"),
-    health_check_enabled=_config.get("health_check_enabled", False),
-    health_check_interval_seconds=_config.get("health_check_interval_seconds", 60),
-    health_check_prompt=_config.get("health_check_prompt", "Say 'ok'"),
-    health_check_max_latency_ms=_config.get("health_check_max_latency_ms", 30000.0),
-)
+config = load_config()
+print(f"Loaded config: {config}")
+rate_limit_callback = RateLimitCallback.from_config(config)
