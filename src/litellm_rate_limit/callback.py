@@ -209,7 +209,7 @@ class RateLimitCallback(CustomLogger):
 
         if await self._health_state.is_rate_limited(model):
             logger.info("Model %s is rate-limited, adding to cooldown cache", model)
-            await self._sync_health_state_to_cooldown(model)
+            await self._sync_health_state_to_cooldown(model, data)
 
         return data
 
@@ -291,7 +291,7 @@ class RateLimitCallback(CustomLogger):
         if is_rate_limit_error(exception):
             cooldown_seconds = extract_rate_limit_reset_seconds(
                 exception,
-                default=self._get_cooldown_for_model(model),
+                default=self._get_cooldown_for_model(model, request_data),
             )
             from litellm_rate_limit.parser import extract_rate_limit_reset_dt
 
@@ -314,10 +314,18 @@ class RateLimitCallback(CustomLogger):
         if router is not None:
             await self._update_cooldown(model, cooldown_seconds, request_data)
 
-    def _get_cooldown_for_model(self, model: str) -> float:
+    def _get_cooldown_for_model(self, model: str, request_data: dict | None = None) -> float:
+        if request_data is not None:
+            litellm_model = request_data.get("litellm_params", {}).get("model", "")
+            if litellm_model and "/" in litellm_model:
+                provider = litellm_model.split("/")[0]
+                if provider in self.provider_cooldown_seconds:
+                    return self.provider_cooldown_seconds[provider]
+
         prefix = _extract_model_prefix(model)
         if prefix in self.provider_cooldown_seconds:
             return self.provider_cooldown_seconds[prefix]
+
         return self.default_cooldown_seconds
 
     async def _update_cooldown(
@@ -380,11 +388,11 @@ class RateLimitCallback(CustomLogger):
                 cooldown_seconds,
             )
 
-    async def _sync_health_state_to_cooldown(self, model: str) -> None:
+    async def _sync_health_state_to_cooldown(self, model: str, request_data: dict | None = None) -> None:
         if self._router is None or not hasattr(self._router, "cooldown_cache"):
             return
 
-        cooldown_seconds = self._get_cooldown_for_model(model)
+        cooldown_seconds = self._get_cooldown_for_model(model, request_data)
 
         deployment_ids = self._get_deployment_ids_for_model(model)
         if deployment_ids:

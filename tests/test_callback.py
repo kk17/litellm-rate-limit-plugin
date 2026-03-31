@@ -138,6 +138,24 @@ class TestRateLimitCallback:
         assert callback._get_cooldown_for_model("openai/gpt-4") == 60.0
         assert callback._get_cooldown_for_model("minimax-m2.5") == 30.0
 
+    def test_get_cooldown_for_model_from_litellm_params(self):
+        callback = RateLimitCallback(
+            provider_cooldown_seconds={"github_copilot": 86400.0},
+        )
+        request_data = {
+            "litellm_params": {"model": "github_copilot/grok-code-fast-1"},
+        }
+        assert callback._get_cooldown_for_model("grok-code-fast-1", request_data) == 86400.0
+
+    def test_get_cooldown_for_model_litellm_params_takes_priority(self):
+        callback = RateLimitCallback(
+            provider_cooldown_seconds={"github_copilot": 86400.0, "grok": 60.0},
+        )
+        request_data = {
+            "litellm_params": {"model": "github_copilot/grok-code-fast-1"},
+        }
+        assert callback._get_cooldown_for_model("grok-code-fast-1", request_data) == 86400.0
+
     def test_get_deployment_ids_for_model_no_router(self):
         callback = RateLimitCallback()
         result = callback._get_deployment_ids_for_model("claude-3-sonnet")

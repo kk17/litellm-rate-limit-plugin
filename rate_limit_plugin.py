@@ -38,5 +38,5 @@ from litellm_rate_limit import RateLimitCallback
 from litellm_rate_limit.config import load_config
 
 config = load_config()
-print(f"Loaded config: {config}")
-rate_limit_callback = RateLimitCallback.from_config(config)
+# print(f"Loaded config: {config}")
+callback = RateLimitCallback.from_config(config)
