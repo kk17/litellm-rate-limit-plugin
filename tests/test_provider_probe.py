@@ -268,6 +268,89 @@ class TestHealthStateManagerWithProbeConfig:
         assert await manager.is_rate_limited("minimax-m2") is False
 
 
+class TestProviderProbeConfigSuffixMatching:
+    """Test config name resolution against litellm_model suffix.
+
+    When config specifies "MiniMax-M2" but model_name is "minimax-m2",
+    the config name should still match via the litellm_model suffix
+    "minimax/MiniMax-M2" -> "MiniMax-M2".
+    """
+
+    def test_config_name_matches_litellm_suffix(self):
+        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["MiniMax-M2"]})
+        model_list = [
+            {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
+            {"model_name": "minimax-m2.5", "litellm_params": {"model": "minimax/MiniMax-M2.5"}},
+        ]
+        config.build_from_router(model_list)
+
+        assert config.is_probe_model("minimax-m2")
+        assert config.get_effective_model("minimax-m2") == "minimax-m2"
+        assert config.get_effective_model("minimax-m2.5") == "minimax-m2"
+
+    def test_config_name_matches_both_model_name_and_suffix(self):
+        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
+        model_list = [
+            {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
+        ]
+        config.build_from_router(model_list)
+
+        assert config.is_probe_model("minimax-m2")
+
+    def test_explicit_model_matches_litellm_suffix(self):
+        config = ProviderProbeConfig(probe_models_by_provider={"zai": ["glm-4.5-air", "GLM-5"]})
+        model_list = [
+            {"model_name": "glm-4.5-air", "litellm_params": {"model": "zai/glm-4.5-air"}},
+            {"model_name": "glm-5", "litellm_params": {"model": "zai/GLM-5"}},
+            {"model_name": "glm-4.6", "litellm_params": {"model": "zai/glm-4.6"}},
+        ]
+        config.build_from_router(model_list)
+
+        assert config.is_probe_model("glm-4.5-air")
+        assert config.is_explicit_model("glm-5")
+        assert config.get_effective_model("glm-5") == "glm-5"
+        assert config.get_effective_model("glm-4.6") == "glm-4.5-air"
+
+    def test_get_litellm_model(self):
+        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["MiniMax-M2"]})
+        model_list = [
+            {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
+            {"model_name": "minimax-m2.5", "litellm_params": {"model": "minimax/MiniMax-M2.5"}},
+        ]
+        config.build_from_router(model_list)
+
+        assert config.get_litellm_model("minimax-m2") == "minimax/MiniMax-M2"
+        assert config.get_litellm_model("minimax-m2.5") == "minimax/MiniMax-M2.5"
+        assert config.get_litellm_model("nonexistent") is None
+
+    def test_get_models_to_health_check_with_suffix_match(self):
+        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["MiniMax-M2"]})
+        model_list = [
+            {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
+            {"model_name": "minimax-m2.5", "litellm_params": {"model": "minimax/MiniMax-M2.5"}},
+        ]
+        config.build_from_router(model_list)
+
+        all_models = ["minimax-m2", "minimax-m2.5"]
+        to_check = config.get_models_to_health_check(all_models)
+
+        assert "minimax-m2" in to_check
+        assert "minimax-m2.5" not in to_check
+
+    @pytest.mark.asyncio
+    async def test_health_state_with_suffix_matched_probe(self):
+        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["MiniMax-M2"]})
+        model_list = [
+            {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
+            {"model_name": "minimax-m2.5", "litellm_params": {"model": "minimax/MiniMax-M2.5"}},
+        ]
+        config.build_from_router(model_list)
+        manager = HealthStateManager(provider_probe_config=config)
+
+        await manager.mark_rate_limited("minimax-m2", 60.0)
+        assert await manager.is_rate_limited("minimax-m2.5") is True
+
+
 class TestGithubCopilotScenario:
     """Test github_copilot provider with heterogeneous models.
 

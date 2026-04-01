@@ -188,9 +188,9 @@ class TestRateLimitCallback:
     def test_get_model_names_from_router(self):
         router = Mock()
         router.model_list = [
-            {"model_name": "claude-3-sonnet"},
-            {"model_name": "claude-3-opus"},
-            {"model_name": "gpt-4"},
+            {"model_name": "claude-3-sonnet", "litellm_params": {"model": "anthropic/claude-3-sonnet"}},
+            {"model_name": "claude-3-opus", "litellm_params": {"model": "anthropic/claude-3-opus"}},
+            {"model_name": "gpt-4", "litellm_params": {"model": "openai/gpt-4"}},
         ]
         callback = RateLimitCallback()
         callback.set_router(router)
@@ -364,3 +364,59 @@ class TestRateLimitCallback:
         )
         is_limited = await callback._alias_state.is_rate_limited("claude-3-sonnet")
         assert is_limited is True
+
+    def test_build_model_mappings(self):
+        router = Mock()
+        router.model_list = [
+            {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
+            {"model_name": "glm-5", "litellm_params": {"model": "zai/glm-5"}},
+        ]
+        callback = RateLimitCallback()
+        callback.set_router(router)
+
+        assert callback._model_name_to_litellm_model == {
+            "minimax-m2": "minimax/MiniMax-M2",
+            "glm-5": "zai/glm-5",
+        }
+
+    def test_build_model_mappings_no_litellm_params(self):
+        router = Mock()
+        router.model_list = [
+            {"model_name": "gpt-4"},
+        ]
+        callback = RateLimitCallback()
+        callback.set_router(router)
+
+        assert callback._model_name_to_litellm_model == {}
+
+    @pytest.mark.asyncio
+    async def test_health_check_client_uses_litellm_model(self):
+        async def mock_acompletion(**kwargs):
+            return None
+
+        router = Mock()
+        router.acompletion = mock_acompletion
+
+        callback = RateLimitCallback()
+        callback._router = router
+        callback._model_name_to_litellm_model = {
+            "minimax-m2": "minimax/MiniMax-M2",
+        }
+
+        client = callback._get_health_check_client()
+        await client("minimax-m2", "test prompt")
+
+    @pytest.mark.asyncio
+    async def test_health_check_client_fallback_to_model_id(self):
+        async def mock_acompletion(**kwargs):
+            return None
+
+        router = Mock()
+        router.acompletion = mock_acompletion
+
+        callback = RateLimitCallback()
+        callback._router = router
+        callback._model_name_to_litellm_model = {}
+
+        client = callback._get_health_check_client()
+        await client("unknown-model", "test prompt")

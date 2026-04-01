@@ -72,12 +72,18 @@ class ProviderProbeConfig:
     _explicit_models: set[str] = field(default_factory=set)
     _probe_models: set[str] = field(default_factory=set)
     _is_built: bool = False
+    _model_name_to_litellm_model: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         pass
 
     def build_from_router(self, model_list: list[dict]) -> None:
         """Build caches from router's model_list.
+
+        Config names in probe_models_by_provider are resolved against both
+        model_name and the model suffix of litellm_model. This allows config
+        entries like "MiniMax-M2" to match deployments where model_name is
+        "minimax-m2" but litellm_params.model is "minimax/MiniMax-M2".
 
         Args:
             model_list: List of deployment dicts from router.model_list
@@ -89,11 +95,14 @@ class ProviderProbeConfig:
         self._model_to_probe.clear()
         self._explicit_models.clear()
         self._probe_models.clear()
+        self._model_name_to_litellm_model.clear()
 
         if not self.probe_models_by_provider:
             self._is_built = True
             logger.debug("No probe_models_by_provider configured, skipping build")
             return
+
+        provider_lookup: dict[str, dict[str, str]] = {}
 
         for deployment in model_list:
             model_name = (
@@ -115,41 +124,62 @@ class ProviderProbeConfig:
                 else getattr(litellm_params, "model", "")
             )
 
+            if litellm_model:
+                self._model_name_to_litellm_model[model_name] = litellm_model
+
             provider = _extract_provider_from_litellm_model(litellm_model)
             if not provider:
                 continue
 
             if provider not in self._provider_to_models:
                 self._provider_to_models[provider] = set()
+                provider_lookup[provider] = {}
             self._provider_to_models[provider].add(model_name)
+
+            # Resolve config names against both model_name and litellm_model suffix
+            # e.g., config "MiniMax-M2" matches litellm_model "minimax/MiniMax-M2" -> model_name "minimax-m2"
+            provider_lookup[provider][model_name] = model_name
+
+            if "/" in litellm_model:
+                model_suffix = litellm_model.split("/", 1)[1]
+                provider_lookup[provider][model_suffix] = model_name
 
         for provider, configured_models in self.probe_models_by_provider.items():
             if not configured_models:
                 continue
 
-            probe_model = configured_models[0]
-            explicit_models = set(configured_models[1:]) if len(configured_models) > 1 else set()
+            lookup = provider_lookup.get(provider, {})
 
-            self._probe_models.add(probe_model)
-            self._explicit_models.update(explicit_models)
+            probe_config_name = configured_models[0]
+            probe_model_name = lookup.get(probe_config_name, probe_config_name)
+
+            explicit_config_names = configured_models[1:] if len(configured_models) > 1 else []
+            explicit_model_names: set[str] = set()
+            for config_name in explicit_config_names:
+                resolved = lookup.get(config_name, config_name)
+                explicit_model_names.add(resolved)
+
+            self._probe_models.add(probe_model_name)
+            self._explicit_models.update(explicit_model_names)
 
             provider_models = self._provider_to_models.get(provider, set())
 
             for model_name in provider_models:
-                if model_name in explicit_models:
+                if model_name in explicit_model_names:
                     self._model_to_probe[model_name] = model_name
-                elif model_name == probe_model:
-                    self._model_to_probe[model_name] = probe_model
+                elif model_name == probe_model_name:
+                    self._model_to_probe[model_name] = probe_model_name
                 else:
-                    self._model_to_probe[model_name] = probe_model
+                    self._model_to_probe[model_name] = probe_model_name
 
         self._is_built = True
         logger.debug(
-            "Built provider probe caches: provider_to_models=%s, model_to_probe=%s, explicit=%s, probes=%s",
+            "Built provider probe caches: provider_to_models=%s, model_to_probe=%s, explicit=%s, probes=%s, litellm_models=%s",
             {k: list(v) for k, v in self._provider_to_models.items()},
             self._model_to_probe,
             self._explicit_models,
             self._probe_models,
+            self._model_name_to_litellm_model,
         )
 
     def update_config(self, probe_models_by_provider: dict[str, list[str]]) -> None:
@@ -178,6 +208,10 @@ class ProviderProbeConfig:
     def is_probe_model(self, model_id: str) -> bool:
         """Check if this model is a probe model for its provider."""
         return model_id in self._probe_models
+
+    def get_litellm_model(self, model_name: str) -> str | None:
+        """Get the litellm_model string (with provider prefix) for a model_name."""
+        return self._model_name_to_litellm_model.get(model_name)
 
     def is_explicit_model(self, model_id: str) -> bool:
         """Check if this model has its own health status (not shared)."""

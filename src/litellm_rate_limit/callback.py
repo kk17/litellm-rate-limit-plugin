@@ -54,6 +54,7 @@ class RateLimitCallback(CustomLogger):
 
         self._health_state = HealthStateManager(provider_probe_config=self._probe_config)
         self._alias_state = AliasAwareHealthState()
+        self._model_name_to_litellm_model: dict[str, str] = {}
 
         self._health_check_enabled = health_check_enabled
         self._health_check_interval = health_check_interval_seconds
@@ -115,6 +116,7 @@ class RateLimitCallback(CustomLogger):
                         logger.info("Router detected via poll thread, starting health checks")
                         self._router = llm_router
                         self._alias_state.set_router(llm_router)
+                        self._build_model_mappings()
 
                         if self._probe_config and hasattr(llm_router, "model_list"):
                             self._probe_config.build_from_router(llm_router.model_list)
@@ -145,6 +147,7 @@ class RateLimitCallback(CustomLogger):
     def set_router(self, router: "LiteLLMRouter") -> None:
         self._router = router
         self._alias_state.set_router(router)
+        self._build_model_mappings()
         logger.info("Router reference set")
 
         if self._probe_config and hasattr(router, "model_list"):
@@ -247,6 +250,7 @@ class RateLimitCallback(CustomLogger):
             if llm_router is not None:
                 self._router = llm_router
                 self._alias_state.set_router(llm_router)
+                self._build_model_mappings()
                 logger.info("Router reference obtained from proxy global")
 
                 if self._probe_config and hasattr(llm_router, "model_list"):
@@ -460,6 +464,38 @@ class RateLimitCallback(CustomLogger):
                 names.add(model_name)
         return sorted(names)
 
+    def _build_model_mappings(self) -> None:
+        if self._router is None:
+            return
+        model_list = getattr(self._router, "model_list", None)
+        if model_list is None:
+            return
+        try:
+            iter(model_list)
+        except TypeError:
+            return
+        self._model_name_to_litellm_model.clear()
+        for deployment in model_list:
+            model_name = (
+                deployment.get("model_name")
+                if isinstance(deployment, dict)
+                else getattr(deployment, "model_name", None)
+            )
+            if not model_name:
+                continue
+            litellm_params = (
+                deployment.get("litellm_params", {})
+                if isinstance(deployment, dict)
+                else getattr(deployment, "litellm_params", {})
+            )
+            litellm_model = (
+                litellm_params.get("model", "")
+                if isinstance(litellm_params, dict)
+                else getattr(litellm_params, "model", "")
+            )
+            if litellm_model:
+                self._model_name_to_litellm_model[model_name] = litellm_model
+
     def _get_models_to_health_check(self, all_models: list[str]) -> list[str]:
         if not all_models:
             return []
@@ -471,12 +507,14 @@ class RateLimitCallback(CustomLogger):
 
     def _get_health_check_client(self) -> Callable:
         router = self._router
+        model_mapping = self._model_name_to_litellm_model
 
         async def client(model_id: str, prompt: str):
             if router is None:
                 raise RuntimeError("Router not set, cannot run health check")
+            litellm_model = model_mapping.get(model_id, model_id)
             return await router.acompletion(
-                model=model_id,
+                model=litellm_model,
                 messages=[{"role": "user", "content": prompt}],
             )
 
