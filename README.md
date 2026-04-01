@@ -30,7 +30,7 @@ litellm_settings:
 rate_limit_plugin:
   default_cooldown_seconds: 60.0
   probe_models_by_provider:
-    minimax: ["minimax-m2"]
+    minimax: ["MiniMax-M2"]
     glm: ["glm-4.5-air", "glm-5"]
 ```
 
@@ -123,7 +123,7 @@ rate_limit_plugin:
     # Specify probe models per provider
     # The first model's health status is used for unlisted models with the same prefix
     probe_models_by_provider:
-      minimax: ["minimax-m2"]
+      minimax: ["MiniMax-M2"]
       zai: ["glm-4.5-air", "glm-5"]
       github-copilot: ["gemini-3-flash-preview", "gpt-4o", "gpt-4.1", "gpt-5-mini"]
 ```
@@ -132,8 +132,8 @@ rate_limit_plugin:
 
 | Config | Probe Model | Explicit Models | Behavior |
 |--------|-------------|-----------------|----------|
-| `minimax: ["minimax-m2"]` | `minimax-m2` | `minimax-m2` | ALL `minimax-*` models share `minimax-m2` health status |
-| `zai: ["glm-4.5-air", "glm-5"]` | `glm-4.5-air` | `glm-4.5-air`, `glm-5` | `glm-4.5-air` status used for unlisted `glm-*` models; `glm-5` has its own status |
+| `minimax: ["MiniMax-M2"]` | `MiniMax-M2` | `MiniMax-M2` | ALL `minimax-*` models share `MiniMax-M2` health status |
+| `zai: ["glm-4.5-air", "glm-5"]` | `glm-4.5-air` | `glm-4.5-air`, `glm-5` | `glm-4.5-air` status used for unlisted `zai` models; `glm-5` has its own status |
 
 **Example:**
 
@@ -154,7 +154,7 @@ from litellm_rate_limit import HealthStateManager, ProviderProbeConfig
 # Configure probe models
 probe_config = ProviderProbeConfig(
     probe_models_by_provider={
-        "minimax": ["minimax-m2"],
+        "minimax": ["MiniMax-M2"],
         "zai": ["glm-4.5-air", "glm-5"],
     }
 )
@@ -163,7 +163,7 @@ probe_config = ProviderProbeConfig(
 health_state = HealthStateManager(provider_probe_config=probe_config)
 
 # Mark probe model as rate-limited
-await health_state.mark_rate_limited("minimax-m2", 60.0)
+await health_state.mark_rate_limited("MiniMax-M2", 60.0)
 
 # All minimax-* models are now blocked
 assert await health_state.is_rate_limited("minimax-abab6.5") is True
@@ -186,7 +186,7 @@ async def main():
     # Configure probe models for provider health sharing
     probe_config = ProviderProbeConfig(
         probe_models_by_provider={
-            "minimax": ["minimax-m2"],
+            "minimax": ["MiniMax-M2"],
             "zai": ["glm-4.5-air", "glm-5"],
         }
     )

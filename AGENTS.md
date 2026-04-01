@@ -60,6 +60,8 @@ A LiteLLM Proxy plugin providing intelligent health checking and rate limit hand
 - `_ensure_router()` lazily obtains router from `litellm.proxy.proxy_server.llm_router`
 - **Auto-starts health checks** when router is first obtained (idempotent via `_health_checks_started` flag)
 - No explicit `set_router()` call required - plugin self-initializes on first hook invocation
+- `_build_model_mappings()` builds `model_name → litellm_model` mapping from router's model_list
+- Health check client resolves model_name to litellm_model (with provider prefix) for API calls
 
 **Integration Point**: Updates `router.cooldown_cache` with precise TTL.
 
@@ -106,16 +108,26 @@ A LiteLLM Proxy plugin providing intelligent health checking and rate limit hand
 - First model in config list is the probe model
 - Explicitly listed models get their own health status
 - Unlisted models share the probe model's health status
+- **Config name resolution**: Config names are resolved against both `model_name` and the suffix of `litellm_params.model` (case-insensitive)
+- Maintains `model_name → litellm_model` mapping for health check API calls
+
+**Config Name Resolution**:
+- Config entries like `"MiniMax-M2"` are matched against both:
+  1. Exact `model_name` (e.g., `"minimax-m2"`)
+  2. Suffix of `litellm_params.model` (e.g., `"minimax/Minimax-M2"` → `"Minimax-M2"`) — **case-insensitive**
+- All internal state stores resolved `model_name`s, not config names
+- Unresolved config names fall through to themselves as a fallback
 
 **Example**:
 ```yaml
 probe_models_by_provider:
-  minimax: ["minimax-m2"]
+  minimax: ["MiniMax-M2"]
   zai: ["glm-4.5-air", "glm-5"]
 ```
 
+- Config `"MiniMax-M2"` resolves to `model_name` `"minimax-m2"` via litellm_model suffix `"minimax/Minimax-M2"`
 - `minimax-m2` health status used for ALL `minimax-*` models
-- `glm-4.5-air` used for unlisted `glm-*` models
+- `glm-4.5-air` used for unlisted `zai/*` models
 - `glm-5` has its own independent health status
 
 ## Data Flows
@@ -209,6 +221,8 @@ rate_limit_plugin:
 | Track by deployment ID | Same model_name can have multiple deployments |
 | Dataclass-based | Simple, typed, no ORM overhead |
 | AsyncIO locks | Thread-safe state mutations |
+| Config name → model_name resolution | Config can use litellm_model suffix (case-insensitive) to reference models |
+| Health check uses litellm_model | API calls need provider-prefixed model string; health state tracks by model_name |
 
 ## Error Handling Patterns
 
