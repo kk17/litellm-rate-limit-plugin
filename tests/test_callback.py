@@ -420,3 +420,207 @@ class TestRateLimitCallback:
 
         client = callback._get_health_check_client()
         await client("unknown-model", "test prompt")
+
+    @pytest.mark.asyncio
+    async def test_log_failure_event_with_none_litellm_params(self):
+        """Regression test: non-ProxyException errors with litellm_params=None must not crash."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock()
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = []
+        callback.set_router(router)
+
+        error = Mock()
+        error.status_code = 500
+        kwargs = {
+            "model": "gpt-5.1",
+            "exception": error,
+            "litellm_params": None,
+        }
+        await callback.async_log_failure_event(
+            kwargs=kwargs, response_obj=None, start_time=None, end_time=None
+        )
+        is_limited = await callback._alias_state.is_rate_limited("gpt-5.1")
+        assert is_limited is True
+
+    @pytest.mark.asyncio
+    async def test_proxy_exception_skipped_in_log_failure_event(self):
+        """ProxyException (auth/config errors) must NOT trigger cooldown."""
+        from litellm.proxy._types import ProxyException
+
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock()
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = []
+        callback.set_router(router)
+
+        error = ProxyException(
+            message="No connected db.",
+            type="no_db_connection",
+            param=None,
+            code=400,
+        )
+        kwargs = {
+            "model": "gpt-5.1",
+            "exception": error,
+            "litellm_params": None,
+        }
+        await callback.async_log_failure_event(
+            kwargs=kwargs, response_obj=None, start_time=None, end_time=None
+        )
+        is_limited = await callback._alias_state.is_rate_limited("gpt-5.1")
+        assert is_limited is False
+        cooldown_cache.add_deployment_to_cooldown.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_proxy_exception_skipped_in_post_call_failure_hook(self):
+        """ProxyException must NOT trigger cooldown via post_call_failure_hook either."""
+        from litellm.proxy._types import ProxyException
+
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock()
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = []
+        callback.set_router(router)
+
+        error = ProxyException(
+            message="Invalid API key",
+            type="auth_error",
+            param=None,
+            code=401,
+        )
+        request_data = {"model": "gpt-5.1", "litellm_params": None}
+        await callback.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=error,
+        )
+        is_limited = await callback._alias_state.is_rate_limited("gpt-5.1")
+        assert is_limited is False
+        cooldown_cache.add_deployment_to_cooldown.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_proxy_exception_invalid_api_key_skipped(self):
+        """ProxyException for invalid API key (status 400) must NOT trigger cooldown."""
+        from litellm.proxy._types import ProxyException
+
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock()
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = []
+        callback.set_router(router)
+
+        error = ProxyException(
+            message="invalid x-api-key",
+            type="auth_error",
+            param=None,
+            code=400,
+        )
+        kwargs = {
+            "model": "gpt-5-mini",
+            "exception": error,
+            "litellm_params": {
+                "model_info": {"id": "38f9706c"},
+                "model": "github_copilot/gpt-5-mini",
+            },
+        }
+        await callback.async_log_failure_event(
+            kwargs=kwargs, response_obj=None, start_time=None, end_time=None
+        )
+        is_limited = await callback._alias_state.is_rate_limited("gpt-5-mini")
+        assert is_limited is False
+        cooldown_cache.add_deployment_to_cooldown.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_log_failure_event_with_none_model_info(self):
+        """Regression test: kwargs with model_info=None should not crash."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock()
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = []
+        callback.set_router(router)
+
+        error = Mock()
+        error.status_code = 500
+        kwargs = {
+            "model": "gpt-5.1",
+            "exception": error,
+            "litellm_params": {"model_info": None, "model": "github_copilot/gpt-5.1"},
+        }
+        # Should NOT raise AttributeError
+        await callback.async_log_failure_event(
+            kwargs=kwargs, response_obj=None, start_time=None, end_time=None
+        )
+        is_limited = await callback._alias_state.is_rate_limited("gpt-5.1")
+        assert is_limited is True
+
+    @pytest.mark.asyncio
+    async def test_post_call_failure_with_none_litellm_params_and_router(self):
+        """Non-proxy 400 errors with litellm_params=None must not crash and must cooldown."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock()
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = []
+        callback.set_router(router)
+
+        error = Mock()
+        error.status_code = 400
+        request_data = {"model": "gpt-5.1", "litellm_params": None}
+        await callback.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=error,
+        )
+        is_limited = await callback._alias_state.is_rate_limited("gpt-5.1")
+        assert is_limited is True
+
+    @pytest.mark.asyncio
+    async def test_log_failure_event_empty_litellm_params(self):
+        """Ensure empty dict litellm_params doesn't crash either."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock()
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = []
+        callback.set_router(router)
+
+        error = Mock()
+        error.status_code = 500
+        kwargs = {
+            "model": "gpt-4",
+            "exception": error,
+            "litellm_params": {},
+        }
+        await callback.async_log_failure_event(
+            kwargs=kwargs, response_obj=None, start_time=None, end_time=None
+        )
+        is_limited = await callback._alias_state.is_rate_limited("gpt-4")
+        assert is_limited is True
+
+    def test_get_cooldown_for_model_none_litellm_params(self):
+        """Regression test: _get_cooldown_for_model must handle litellm_params=None."""
+        callback = RateLimitCallback(
+            provider_cooldown_seconds={"github_copilot": 86400.0},
+        )
+        request_data = {"litellm_params": None}
+        # Should NOT raise AttributeError, should fall back to default
+        assert callback._get_cooldown_for_model("gpt-5.1", request_data) == 60.0
+
+    def test_get_cooldown_for_model_non_dict_litellm_params(self):
+        """Regression test: _get_cooldown_for_model must handle non-dict litellm_params."""
+        callback = RateLimitCallback(
+            provider_cooldown_seconds={"github_copilot": 86400.0},
+        )
+        request_data = {"litellm_params": "not_a_dict"}
+        assert callback._get_cooldown_for_model("gpt-5.1", request_data) == 60.0

@@ -8,7 +8,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.utils import DualCache
 
 from litellm_rate_limit.alias_aware_state import AliasAwareHealthState
@@ -278,6 +278,14 @@ class RateLimitCallback(CustomLogger):
     async def _handle_deployment_failure(
         self, exception: Exception, model: str, request_data: dict | None = None
     ) -> None:
+        if isinstance(exception, ProxyException):
+            logger.debug(
+                "ProxyException (auth/config error), skipping cooldown for %s: %s",
+                model,
+                exception,
+            )
+            return
+
         detected = detect_api_error(exception)
         if detected is not None:
             is_err, status_code, _ = detected
@@ -320,11 +328,13 @@ class RateLimitCallback(CustomLogger):
 
     def _get_cooldown_for_model(self, model: str, request_data: dict | None = None) -> float:
         if request_data is not None:
-            litellm_model = request_data.get("litellm_params", {}).get("model", "")
-            if litellm_model and "/" in litellm_model:
-                provider = litellm_model.split("/")[0]
-                if provider in self.provider_cooldown_seconds:
-                    return self.provider_cooldown_seconds[provider]
+            litellm_params = request_data.get("litellm_params")
+            if isinstance(litellm_params, dict):
+                litellm_model = litellm_params.get("model", "")
+                if litellm_model and "/" in litellm_model:
+                    provider = litellm_model.split("/")[0]
+                    if provider in self.provider_cooldown_seconds:
+                        return self.provider_cooldown_seconds[provider]
 
         prefix = _extract_model_prefix(model)
         if prefix in self.provider_cooldown_seconds:
@@ -342,7 +352,9 @@ class RateLimitCallback(CustomLogger):
         async with self._cooldown_cache_lock:
             deployment_id = None
             if request_data is not None:
-                deployment_id = request_data.get("litellm_params", {}).get("model_info", {}).get("id")
+                litellm_params = request_data.get("litellm_params") or {}
+                model_info = litellm_params.get("model_info") if isinstance(litellm_params, dict) else None
+                deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
 
             if deployment_id:
                 self._router.cooldown_cache.add_deployment_to_cooldown(
