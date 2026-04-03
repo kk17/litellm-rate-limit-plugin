@@ -1,0 +1,87 @@
+# https://docs.litellm.ai/docs/proxy/config_settings
+environment_variables:
+  DISABLE_ADMIN_UI: True
+
+model_list:
+  - model_name: minimax-m2.5
+    litellm_params:
+      model: minimax/MiniMax-M2.5
+      api_key: os.environ/MINIMAX_API_KEY
+  - model_name: minimax-m2
+    litellm_params:
+      model: minimax/MiniMax-M2
+      api_key: os.environ/MINIMAX_API_KEY
+
+  - model_name: glm-4.5
+    litellm_params:
+      model: zai/glm-4.5
+      api_base: os.environ/ZAI_API_BASE
+      api_key: os.environ/ZAI_API_KEY
+  - model_name: glm-4.5-air
+    litellm_params:
+      model: zai/glm-4.5-air
+      api_base: os.environ/ZAI_API_BASE
+      api_key: os.environ/ZAI_API_KEY
+
+  - model_name: claude-haiku-4.5
+    litellm_params:
+      model: github_copilot/claude-haiku-4.5
+
+  - model_name: gpt-5-mini
+    litellm_params:
+      model: github_copilot/gpt-5-mini
+
+  - model_name: grok-code-fast-1
+    litellm_params:
+      model: github_copilot/grok-code-fast-1
+
+litellm_settings:
+  drop_params: true
+  callbacks:
+    - rate_limit_plugin.callback
+
+router_settings:
+  fallbacks:
+    - claude-haiku-4.5:
+        - glm-4.5-air
+        - minimax-m2
+
+  model_group_alias:
+    claude-haiku-4-5: claude-haiku-4.5
+
+general_settings:
+  master_key: os.environ/MASTER_KEY
+
+rate_limit_plugin:
+  # Default cooldown when no reset time in headers
+  default_cooldown_seconds: 3600
+
+  # Header parsing configuration
+  header_parsing:
+    enabled: true
+    # Anthropic's unified reset header (Unix timestamp)
+    anthropic_reset_header: "anthropic-ratelimit-unified-reset"
+
+  # Health check configuration
+  health_check:
+    enabled: true
+    # How often to run health checks (seconds)
+    interval_seconds: 3600
+    # Prompt to send for health checks
+    test_prompt: "Say 'ok'"
+    # Maximum acceptable latency (ms)
+    max_latency_ms: 30000
+    # Timeout for individual health checks (seconds)
+    timeout_seconds: 30
+    probe_models_by_provider:
+      minimax:
+        - MiniMax-M2
+      zai:
+        - glm-4.5-air
+      github_copilot:
+        - grok-code-fast-1
+        - gpt-5-mini
+  provider_cooldown_seconds:
+    github_copilot: 86400
+    minimax: 3600
+    zai: 3600
