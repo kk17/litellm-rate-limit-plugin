@@ -33,7 +33,7 @@ class HealthCheckConfig:
     test_prompt: str = "Say 'ok'"
     max_latency_ms: float = 30000.0
     timeout_seconds: int = 30
-    probe_models_by_provider: dict[str, list[str]] = field(default_factory=dict)
+    models_to_check: list[dict[str, list[str]]] = field(default_factory=list)
 
 
 @dataclass
@@ -62,13 +62,16 @@ class RateLimitPluginConfig:
             test_prompt: "Say 'ok'"
             max_latency_ms: 30000
             timeout_seconds: 30
-            probe_models_by_provider:
-              minimax: ["minimax-m2"]
-              zai: ["glm-4.5-air"]
+            models_to_check:
+              - minimax-m2.7:
+                - minimax-m2.5
+                - minimax-m2
+              - glm-4.5-air:
+                - glm-4.5-air
+                - glm-4.5
     """
 
     default_cooldown_seconds: float = 60.0
-    provider_cooldown_seconds: dict[str, float] = field(default_factory=dict)
     health_check: HealthCheckConfig = field(default_factory=HealthCheckConfig)
     header_parsing: HeaderParsingConfig = field(default_factory=HeaderParsingConfig)
 
@@ -142,20 +145,32 @@ def _load_config_from_yaml() -> dict[str, Any]:
         return {}
 
 
-def _parse_probe_models(value: Any) -> dict[str, list[str]]:
-    """Parse probe_models_by_provider from various formats."""
+def _normalize_models_to_check(value: Any) -> list[dict[str, list[str]]]:
+    """Normalize models_to_check from YAML/JSON/env into list[dict[str, list[str]]].
+
+    Accepts two formats:
+    - dict: {"probe-model": ["model-a", "model-b"]}  (YAML without - prefix)
+    - list: [{"probe-model": ["model-a", "model-b"]}] (YAML with - prefix)
+    """
     if isinstance(value, dict):
-        return {k: list(v) if not isinstance(v, list) else v for k, v in value.items()}
+        return [{k: list(v) if not isinstance(v, list) else v} for k, v in value.items()]
+
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    result.append({k: list(v) if not isinstance(v, list) else v})
+        return result
 
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
-            if isinstance(parsed, dict):
-                return parsed
+            return _normalize_models_to_check(parsed)
         except json.JSONDecodeError:
             pass
 
-    return {}
+    return []
 
 
 def load_config() -> RateLimitPluginConfig:
@@ -167,12 +182,6 @@ def load_config() -> RateLimitPluginConfig:
     # Top-level keys
     if "default_cooldown_seconds" in yaml_config:
         config.default_cooldown_seconds = float(yaml_config["default_cooldown_seconds"])
-
-    # Provider cooldown (top-level key in config, not nested)
-    if "provider_cooldown_seconds" in yaml_config:
-        pc = yaml_config["provider_cooldown_seconds"]
-        if isinstance(pc, dict):
-            config.provider_cooldown_seconds = {k: float(v) for k, v in pc.items()}
 
     # Header parsing (nested under header_parsing)
     if "header_parsing" in yaml_config:
@@ -197,10 +206,8 @@ def load_config() -> RateLimitPluginConfig:
                 config.health_check.max_latency_ms = float(hc["max_latency_ms"])
             if "timeout_seconds" in hc:
                 config.health_check.timeout_seconds = int(hc["timeout_seconds"])
-            if "probe_models_by_provider" in hc:
-                config.health_check.probe_models_by_provider = _parse_probe_models(
-                    hc["probe_models_by_provider"]
-                )
+            if "models_to_check" in hc:
+                config.health_check.models_to_check = _normalize_models_to_check(hc["models_to_check"])
 
     # Environment variable overrides
     env_cooldown = os.environ.get("RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS")
@@ -238,20 +245,8 @@ def load_config() -> RateLimitPluginConfig:
 
     env_probe_models = os.environ.get("RATE_LIMIT_PROBE_MODELS")
     if env_probe_models:
-        parsed = _parse_probe_models(env_probe_models)
+        parsed = _normalize_models_to_check(env_probe_models)
         if parsed:
-            config.health_check.probe_models_by_provider = parsed
-
-    env_provider_cooldown = os.environ.get("RATE_LIMIT_PROVIDER_COOLDOWN")
-    if env_provider_cooldown:
-        try:
-            parsed = json.loads(env_provider_cooldown)
-            if isinstance(parsed, dict):
-                config.provider_cooldown_seconds = {k: float(v) for k, v in parsed.items()}
-                logger.debug(
-                    "Override provider_cooldown_seconds from env: %s", config.provider_cooldown_seconds
-                )
-        except (json.JSONDecodeError, ValueError, TypeError) as e:
-            logger.warning("Failed to parse RATE_LIMIT_PROVIDER_COOLDOWN: %s", e)
+            config.health_check.models_to_check = parsed
 
     return config

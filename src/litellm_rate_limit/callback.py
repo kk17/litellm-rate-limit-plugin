@@ -16,7 +16,7 @@ from litellm_rate_limit.config import RateLimitPluginConfig
 from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
 from litellm_rate_limit.health_state import HealthStateManager
 from litellm_rate_limit.parser import detect_api_error, extract_rate_limit_reset_seconds, is_rate_limit_error
-from litellm_rate_limit.provider_probe import ProviderProbeConfig, _extract_model_prefix
+from litellm_rate_limit.provider_probe import ProviderProbeConfig
 
 if TYPE_CHECKING:
     from litellm.router import Router as LiteLLMRouter
@@ -36,21 +36,19 @@ class RateLimitCallback(CustomLogger):
     def __init__(
         self,
         default_cooldown_seconds: float = 60.0,
-        probe_models_by_provider: dict[str, list[str]] | None = None,
-        provider_cooldown_seconds: dict[str, float] | None = None,
+        models_to_check: list[dict[str, list[str]]] | None = None,
         health_check_enabled: bool = False,
         health_check_interval_seconds: int = 60,
         health_check_prompt: str = "Say 'ok'",
         health_check_max_latency_ms: float = 30000.0,
     ):
         self.default_cooldown_seconds = default_cooldown_seconds
-        self.provider_cooldown_seconds = provider_cooldown_seconds or {}
         self._router: LiteLLMRouter | None = None
         self._cooldown_cache_lock = asyncio.Lock()
 
         self._probe_config: ProviderProbeConfig | None = None
-        if probe_models_by_provider:
-            self._probe_config = ProviderProbeConfig(probe_models_by_provider=probe_models_by_provider)
+        if models_to_check:
+            self._probe_config = ProviderProbeConfig(models_to_check=models_to_check)
 
         self._health_state = HealthStateManager(provider_probe_config=self._probe_config)
         self._alias_state = AliasAwareHealthState()
@@ -85,19 +83,17 @@ class RateLimitCallback(CustomLogger):
             self._start_router_poll_thread()
 
         logger.info(
-            "RateLimitCallback initialized: cooldown=%.1fs, provider_cooldown=%s, health_check=%s, probe_config=%s",
+            "RateLimitCallback initialized: cooldown=%.1fs, health_check=%s, probe_config=%s",
             default_cooldown_seconds,
-            bool(self.provider_cooldown_seconds),
             health_check_enabled,
-            bool(probe_models_by_provider),
+            bool(models_to_check),
         )
 
     @classmethod
     def from_config(cls, config: RateLimitPluginConfig) -> "RateLimitCallback":
         return cls(
             default_cooldown_seconds=config.default_cooldown_seconds,
-            provider_cooldown_seconds=config.provider_cooldown_seconds,
-            probe_models_by_provider=config.health_check.probe_models_by_provider,
+            models_to_check=config.health_check.models_to_check,
             health_check_enabled=config.health_check.enabled,
             health_check_interval_seconds=config.health_check.interval_seconds,
             health_check_prompt=config.health_check.test_prompt,
@@ -327,19 +323,6 @@ class RateLimitCallback(CustomLogger):
             await self._update_cooldown(model, cooldown_seconds, request_data)
 
     def _get_cooldown_for_model(self, model: str, request_data: dict | None = None) -> float:
-        if request_data is not None:
-            litellm_params = request_data.get("litellm_params")
-            if isinstance(litellm_params, dict):
-                litellm_model = litellm_params.get("model", "")
-                if litellm_model and "/" in litellm_model:
-                    provider = litellm_model.split("/")[0]
-                    if provider in self.provider_cooldown_seconds:
-                        return self.provider_cooldown_seconds[provider]
-
-        prefix = _extract_model_prefix(model)
-        if prefix in self.provider_cooldown_seconds:
-            return self.provider_cooldown_seconds[prefix]
-
         return self.default_cooldown_seconds
 
     async def _update_cooldown(
@@ -512,7 +495,7 @@ class RateLimitCallback(CustomLogger):
         if not all_models:
             return []
 
-        if not self._probe_config or not self._probe_config.probe_models_by_provider:
+        if not self._probe_config or not self._probe_config.models_to_check:
             return all_models
 
         return self._probe_config.get_models_to_health_check(all_models)
