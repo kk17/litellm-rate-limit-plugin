@@ -3,41 +3,7 @@
 import pytest
 
 from litellm_rate_limit.health_state import HealthStateManager
-from litellm_rate_limit.provider_probe import (
-    ProviderProbeConfig,
-    _extract_model_prefix,
-    _extract_provider_from_litellm_model,
-)
-
-
-class TestExtractModelPrefix:
-    """Tests for _extract_model_prefix helper."""
-
-    def test_extract_prefix_with_slash(self):
-        assert _extract_model_prefix("openai/gpt-4") == "openai"
-        assert _extract_model_prefix("anthropic/claude-3-opus") == "anthropic"
-
-    def test_extract_prefix_no_slash(self):
-        assert _extract_model_prefix("minimax-m2") == "minimax"
-        assert _extract_model_prefix("glm-4.5-air") == "glm"
-
-    def test_extract_prefix_single_word(self):
-        assert _extract_model_prefix("gpt4") == "gpt4"
-
-
-class TestExtractProviderFromLitellmModel:
-    """Tests for _extract_provider_from_litellm_model helper."""
-
-    def test_extract_provider_with_slash(self):
-        assert _extract_provider_from_litellm_model("github_copilot/gpt-5.2") == "github_copilot"
-        assert _extract_provider_from_litellm_model("minimax/Minimax-M2") == "minimax"
-        assert _extract_provider_from_litellm_model("zai/glm-5") == "zai"
-
-    def test_extract_provider_no_slash(self):
-        assert _extract_provider_from_litellm_model("gpt-4") == ""
-
-    def test_extract_provider_with_multiple_slashes(self):
-        assert _extract_provider_from_litellm_model("azure/gpt-4/deployment-1") == "azure"
+from litellm_rate_limit.provider_probe import ProviderProbeConfig
 
 
 class TestProviderProbeConfig:
@@ -45,16 +11,16 @@ class TestProviderProbeConfig:
 
     def test_init_empty(self):
         config = ProviderProbeConfig()
-        assert config.probe_models_by_provider == {}
+        assert config.models_to_check == []
         assert not config.is_built()
 
     def test_init_with_config(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
-        assert config.probe_models_by_provider == {"minimax": ["minimax-m2"]}
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
+        assert config.models_to_check == [{"minimax-m2": ["minimax-m2", "minimax-other"]}]
         assert not config.is_built()
 
     def test_build_from_router_single_provider(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
             {"model_name": "minimax-other", "litellm_params": {"model": "minimax/Minimax-Other"}},
@@ -66,8 +32,13 @@ class TestProviderProbeConfig:
         assert config.get_effective_model("minimax-other") == "minimax-m2"
         assert config.get_effective_model("minimax-m2") == "minimax-m2"
 
-    def test_build_from_router_multiple_models_in_config(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"zai": ["glm-4.5-air", "glm-5"]})
+    def test_build_from_router_multiple_probes(self):
+        config = ProviderProbeConfig(
+            models_to_check=[
+                {"glm-4.5-air": ["glm-4.5-air", "glm-4.6"]},
+                {"glm-5": ["glm-5"]},
+            ]
+        )
         model_list = [
             {"model_name": "glm-4.5-air", "litellm_params": {"model": "zai/glm-4.5-air"}},
             {"model_name": "glm-5", "litellm_params": {"model": "zai/glm-5"}},
@@ -76,17 +47,17 @@ class TestProviderProbeConfig:
         config.build_from_router(model_list)
 
         assert config.is_probe_model("glm-4.5-air")
-        assert config.is_explicit_model("glm-5")
+        assert config.is_probe_model("glm-5")
         assert config.get_effective_model("glm-4.5-air") == "glm-4.5-air"
         assert config.get_effective_model("glm-5") == "glm-5"
         assert config.get_effective_model("glm-4.6") == "glm-4.5-air"
 
-    def test_build_from_router_multiple_providers(self):
+    def test_build_from_router_cross_probe_resolution(self):
         config = ProviderProbeConfig(
-            probe_models_by_provider={
-                "minimax": ["minimax-m2"],
-                "zai": ["glm-4.5-air"],
-            }
+            models_to_check=[
+                {"minimax-m2": ["minimax-m2", "minimax-other"]},
+                {"glm-4.5-air": ["glm-4.5-air", "glm-5"]},
+            ]
         )
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
@@ -100,7 +71,7 @@ class TestProviderProbeConfig:
         assert config.get_effective_model("glm-5") == "glm-4.5-air"
 
     def test_get_effective_model_probe_model(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
         ]
@@ -108,8 +79,13 @@ class TestProviderProbeConfig:
 
         assert config.get_effective_model("minimax-m2") == "minimax-m2"
 
-    def test_get_effective_model_explicit_gets_own_status(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"zai": ["glm-4.5-air", "glm-5"]})
+    def test_get_effective_model_independent_model(self):
+        config = ProviderProbeConfig(
+            models_to_check=[
+                {"glm-4.5-air": ["glm-4.5-air", "glm-4.6"]},
+                {"glm-5": ["glm-5"]},
+            ]
+        )
         model_list = [
             {"model_name": "glm-4.5-air", "litellm_params": {"model": "zai/glm-4.5-air"}},
             {"model_name": "glm-5", "litellm_params": {"model": "zai/glm-5"}},
@@ -118,12 +94,12 @@ class TestProviderProbeConfig:
 
         assert config.get_effective_model("glm-5") == "glm-5"
 
-    def test_get_effective_model_no_provider_config(self):
+    def test_get_effective_model_unlisted_model(self):
         config = ProviderProbeConfig()
         assert config.get_effective_model("any-model") == "any-model"
 
     def test_is_probe_model(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
         ]
@@ -133,18 +109,18 @@ class TestProviderProbeConfig:
         assert config.is_probe_model("minimax-other") is False
 
     def test_update_config(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
         ]
         config.build_from_router(model_list)
         assert config.is_built()
 
-        config.update_config({"zai": ["glm-4.5-air"]})
+        config.update_config([{"glm-4.5-air": ["glm-4.5-air"]}])
         assert not config.is_built()
 
     def test_get_probe_share_map(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
             {"model_name": "minimax-other", "litellm_params": {"model": "minimax/Minimax-Other"}},
@@ -156,7 +132,7 @@ class TestProviderProbeConfig:
         assert "minimax-other" in share_map["minimax-m2"]
 
     def test_get_models_to_health_check(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
             {"model_name": "minimax-other", "litellm_params": {"model": "minimax/Minimax-Other"}},
@@ -175,7 +151,7 @@ class TestHealthStateManagerWithProbeConfig:
 
     @pytest.fixture
     def minimax_config(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
             {"model_name": "minimax-other", "litellm_params": {"model": "minimax/Minimax-Other"}},
@@ -185,7 +161,12 @@ class TestHealthStateManagerWithProbeConfig:
 
     @pytest.fixture
     def zai_config(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"zai": ["glm-4.5-air", "glm-5"]})
+        config = ProviderProbeConfig(
+            models_to_check=[
+                {"glm-4.5-air": ["glm-4.5-air", "glm-4.6"]},
+                {"glm-5": ["glm-5"]},
+            ]
+        )
         model_list = [
             {"model_name": "glm-4.5-air", "litellm_params": {"model": "zai/glm-4.5-air"}},
             {"model_name": "glm-5", "litellm_params": {"model": "zai/glm-5"}},
@@ -211,7 +192,7 @@ class TestHealthStateManagerWithProbeConfig:
         assert await manager.is_rate_limited("minimax-other") is True
 
     @pytest.mark.asyncio
-    async def test_explicit_model_gets_own_status(self, zai_config):
+    async def test_independent_probe_gets_own_status(self, zai_config):
         manager = HealthStateManager(provider_probe_config=zai_config)
 
         await manager.mark_rate_limited("glm-4.5-air", 60.0)
@@ -268,110 +249,90 @@ class TestHealthStateManagerWithProbeConfig:
         assert await manager.is_rate_limited("minimax-m2") is False
 
 
-class TestProviderProbeConfigSuffixMatching:
-    """Test config name resolution against litellm_model suffix.
+class TestProviderProbeConfigLitellmModelMapping:
+    """Test litellm_model mapping for health check API calls.
 
-    When config specifies "MiniMax-M2" but model_name is "minimax-m2",
-    the config name should still match via the litellm_model suffix
-    "minimax/MiniMax-M2" -> "MiniMax-M2".
+    Health checks need the provider-prefixed model string (litellm_model)
+    while health state tracks by model_name.
     """
 
-    def test_config_name_matches_litellm_suffix(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["MiniMax-M2"]})
+    def test_get_litellm_model(self):
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
-            {"model_name": "minimax-m2.5", "litellm_params": {"model": "minimax/MiniMax-M2.5"}},
+            {"model_name": "minimax-other", "litellm_params": {"model": "minimax/MiniMax-Other"}},
+        ]
+        config.build_from_router(model_list)
+
+        assert config.get_litellm_model("minimax-m2") == "minimax/MiniMax-M2"
+        assert config.get_litellm_model("minimax-other") == "minimax/MiniMax-Other"
+        assert config.get_litellm_model("nonexistent") is None
+
+    def test_config_key_matches_litellm_suffix(self):
+        """Config keys are matched against model_name (case-insensitive from litellm_model suffix)."""
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
+        model_list = [
+            {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
+            {"model_name": "minimax-other", "litellm_params": {"model": "minimax/MiniMax-Other"}},
         ]
         config.build_from_router(model_list)
 
         assert config.is_probe_model("minimax-m2")
         assert config.get_effective_model("minimax-m2") == "minimax-m2"
-        assert config.get_effective_model("minimax-m2.5") == "minimax-m2"
+        assert config.get_effective_model("minimax-other") == "minimax-m2"
 
-    def test_config_name_matches_both_model_name_and_suffix(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["minimax-m2"]})
-        model_list = [
-            {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
-        ]
-        config.build_from_router(model_list)
-
-        assert config.is_probe_model("minimax-m2")
-
-    def test_explicit_model_matches_litellm_suffix(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"zai": ["glm-4.5-air", "GLM-5"]})
-        model_list = [
-            {"model_name": "glm-4.5-air", "litellm_params": {"model": "zai/glm-4.5-air"}},
-            {"model_name": "glm-5", "litellm_params": {"model": "zai/GLM-5"}},
-            {"model_name": "glm-4.6", "litellm_params": {"model": "zai/glm-4.6"}},
-        ]
-        config.build_from_router(model_list)
-
-        assert config.is_probe_model("glm-4.5-air")
-        assert config.is_explicit_model("glm-5")
-        assert config.get_effective_model("glm-5") == "glm-5"
-        assert config.get_effective_model("glm-4.6") == "glm-4.5-air"
-
-    def test_get_litellm_model(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["MiniMax-M2"]})
+    def test_get_models_to_health_check_filters_shared_models(self):
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
-            {"model_name": "minimax-m2.5", "litellm_params": {"model": "minimax/MiniMax-M2.5"}},
+            {"model_name": "minimax-other", "litellm_params": {"model": "minimax/MiniMax-Other"}},
         ]
         config.build_from_router(model_list)
 
-        assert config.get_litellm_model("minimax-m2") == "minimax/MiniMax-M2"
-        assert config.get_litellm_model("minimax-m2.5") == "minimax/MiniMax-M2.5"
-        assert config.get_litellm_model("nonexistent") is None
-
-    def test_get_models_to_health_check_with_suffix_match(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["MiniMax-M2"]})
-        model_list = [
-            {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
-            {"model_name": "minimax-m2.5", "litellm_params": {"model": "minimax/MiniMax-M2.5"}},
-        ]
-        config.build_from_router(model_list)
-
-        all_models = ["minimax-m2", "minimax-m2.5"]
+        all_models = ["minimax-m2", "minimax-other"]
         to_check = config.get_models_to_health_check(all_models)
 
         assert "minimax-m2" in to_check
-        assert "minimax-m2.5" not in to_check
+        assert "minimax-other" not in to_check
 
     @pytest.mark.asyncio
-    async def test_health_state_with_suffix_matched_probe(self):
-        config = ProviderProbeConfig(probe_models_by_provider={"minimax": ["MiniMax-M2"]})
+    async def test_health_state_with_shared_probe(self):
+        config = ProviderProbeConfig(models_to_check=[{"minimax-m2": ["minimax-m2", "minimax-other"]}])
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/MiniMax-M2"}},
-            {"model_name": "minimax-m2.5", "litellm_params": {"model": "minimax/MiniMax-M2.5"}},
+            {"model_name": "minimax-other", "litellm_params": {"model": "minimax/MiniMax-Other"}},
         ]
         config.build_from_router(model_list)
         manager = HealthStateManager(provider_probe_config=config)
 
         await manager.mark_rate_limited("minimax-m2", 60.0)
-        assert await manager.is_rate_limited("minimax-m2.5") is True
+        assert await manager.is_rate_limited("minimax-other") is True
 
 
 class TestGithubCopilotScenario:
     """Test github_copilot provider with heterogeneous models.
 
     github_copilot has models like grok-code-fast-1, gpt-4o, gemini-3-flash-preview, etc.
-    The first model in probe_models_by_provider is the probe model.
-    Models 2-N are explicit (own health status).
-    Other models share the probe model's health status.
+    Each probe model shares health status with models in its list.
+    Probe models can have independent status if they're their own list.
     """
 
     @pytest.fixture
     def github_copilot_config(self):
         config = ProviderProbeConfig(
-            probe_models_by_provider={
-                "github_copilot": [
-                    "grok-code-fast-1",
-                    "gemini-3-flash-preview",
-                    "gpt-4o",
-                    "gpt-4.1",
-                    "gpt-5-mini",
-                ]
-            }
+            models_to_check=[
+                {
+                    "grok-code-fast-1": [
+                        "grok-code-fast-1",
+                        "gpt-5.2",
+                        "claude-sonnet-4.6",
+                    ]
+                },
+                {"gemini-3-flash-preview": ["gemini-3-flash-preview"]},
+                {"gpt-4o": ["gpt-4o"]},
+                {"gpt-4.1": ["gpt-4.1"]},
+                {"gpt-5-mini": ["gpt-5-mini"]},
+            ]
         )
         model_list = [
             {
@@ -397,17 +358,17 @@ class TestGithubCopilotScenario:
     def test_probe_model_is_grok(self, github_copilot_config):
         assert github_copilot_config.is_probe_model("grok-code-fast-1") is True
 
-    def test_explicit_models_have_own_status(self, github_copilot_config):
-        assert github_copilot_config.is_explicit_model("gemini-3-flash-preview") is True
-        assert github_copilot_config.is_explicit_model("gpt-4o") is True
-        assert github_copilot_config.is_explicit_model("gpt-4.1") is True
-        assert github_copilot_config.is_explicit_model("gpt-5-mini") is True
+    def test_independent_models_have_own_status(self, github_copilot_config):
+        assert github_copilot_config.is_probe_model("gemini-3-flash-preview") is True
+        assert github_copilot_config.is_probe_model("gpt-4o") is True
+        assert github_copilot_config.is_probe_model("gpt-4.1") is True
+        assert github_copilot_config.is_probe_model("gpt-5-mini") is True
 
     def test_unlisted_model_uses_probe(self, github_copilot_config):
         assert github_copilot_config.get_effective_model("gpt-5.2") == "grok-code-fast-1"
         assert github_copilot_config.get_effective_model("claude-sonnet-4.6") == "grok-code-fast-1"
 
-    def test_explicit_model_returns_self(self, github_copilot_config):
+    def test_independent_model_returns_self(self, github_copilot_config):
         assert github_copilot_config.get_effective_model("gpt-4o") == "gpt-4o"
         assert github_copilot_config.get_effective_model("gemini-3-flash-preview") == "gemini-3-flash-preview"
         assert github_copilot_config.get_effective_model("grok-code-fast-1") == "grok-code-fast-1"
@@ -424,7 +385,7 @@ class TestGithubCopilotScenario:
         assert await manager.is_rate_limited("gemini-3-flash-preview") is False
 
     @pytest.mark.asyncio
-    async def test_mark_rate_limited_on_unlisted_model(self, github_copilot_config):
+    async def test_mark_rate_limited_on_shared_model(self, github_copilot_config):
         manager = HealthStateManager(provider_probe_config=github_copilot_config)
 
         await manager.mark_rate_limited("gpt-5.2", 60.0)
@@ -462,16 +423,23 @@ class TestGithubCopilotScenario:
 
 
 class TestMultiProviderScenario:
-    """Test multiple providers with different configurations."""
+    """Test multiple probes with different configurations."""
 
     @pytest.fixture
-    def multi_provider_config(self):
+    def multi_probe_config(self):
         config = ProviderProbeConfig(
-            probe_models_by_provider={
-                "minimax": ["minimax-m2"],
-                "zai": ["glm-4.5-air"],
-                "github_copilot": ["grok-code-fast-1", "gemini-3-flash-preview", "gpt-4o"],
-            }
+            models_to_check=[
+                {"minimax-m2": ["minimax-m2", "minimax-m2.5"]},
+                {"glm-4.5-air": ["glm-4.5-air", "glm-5"]},
+                {
+                    "grok-code-fast-1": [
+                        "grok-code-fast-1",
+                        "gpt-5.2",
+                    ]
+                },
+                {"gemini-3-flash-preview": ["gemini-3-flash-preview"]},
+                {"gpt-4o": ["gpt-4o"]},
+            ]
         )
         model_list = [
             {"model_name": "minimax-m2", "litellm_params": {"model": "minimax/Minimax-M2"}},
@@ -489,8 +457,8 @@ class TestMultiProviderScenario:
         return config
 
     @pytest.mark.asyncio
-    async def test_providers_independent(self, multi_provider_config):
-        manager = HealthStateManager(provider_probe_config=multi_provider_config)
+    async def test_probes_independent(self, multi_probe_config):
+        manager = HealthStateManager(provider_probe_config=multi_probe_config)
 
         await manager.mark_rate_limited("minimax-m2", 60.0)
 
@@ -499,8 +467,8 @@ class TestMultiProviderScenario:
         assert await manager.is_rate_limited("gpt-5.2") is False
 
     @pytest.mark.asyncio
-    async def test_cross_provider_isolation(self, multi_provider_config):
-        manager = HealthStateManager(provider_probe_config=multi_provider_config)
+    async def test_cross_probe_isolation(self, multi_probe_config):
+        manager = HealthStateManager(provider_probe_config=multi_probe_config)
 
         await manager.mark_rate_limited("grok-code-fast-1", 60.0)
 

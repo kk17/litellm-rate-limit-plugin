@@ -194,8 +194,9 @@ litellm_settings:
 
 rate_limit_plugin:
   default_cooldown_seconds: 1
-  probe_models_by_provider:
-    openai: ["gpt-4o-mini"]
+  models_to_check:
+    - gpt-4o-mini:
+      - gpt-4o-mini
 """
 
 _CONFIG_TEMPLATE_FALLBACK = """
@@ -235,9 +236,6 @@ router_settings:
 
 rate_limit_plugin:
   default_cooldown_seconds: 2
-  provider_cooldown_seconds:
-    github-copilot: 300
-    minimax: 30
 """
 
 

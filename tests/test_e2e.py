@@ -164,10 +164,10 @@ def callback(mock_router):
     """Create a callback with router reference."""
     cb = RateLimitCallback(
         default_cooldown_seconds=60.0,
-        probe_models_by_provider={
-            "openai": ["gpt-4", "gpt-4o-mini"],
-            "anthropic": ["claude-3-opus"],
-        },
+        models_to_check=[
+            {"gpt-4": ["gpt-4", "gpt-4o-mini"]},
+            {"claude-3-opus": ["claude-3-opus"]},
+        ],
     )
     cb.set_router(mock_router)
     return cb
@@ -408,12 +408,8 @@ class TestNonRateLimitErrors:
         assert is_limited is False
 
     @pytest.mark.asyncio
-    async def test_402_error_triggers_cooldown_with_provider_cooldown(
-        self, callback, mock_router, mock_user_auth
-    ):
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"github-copilot": 600.0, "zai": 30.0},
-        )
+    async def test_402_error_triggers_cooldown(self, callback, mock_router, mock_user_auth):
+        callback = RateLimitCallback()
 
         error = create_rate_limit_error(status_code=402, headers={})
 
@@ -423,38 +419,6 @@ class TestNonRateLimitErrors:
             user_api_key_dict=mock_user_auth,
         )
         is_limited = await callback._alias_state.is_rate_limited("github-copilot/claude-opus-4.6")
-        assert is_limited is True
-
-    @pytest.mark.asyncio
-    async def test_provider_cooldown_prefix_match(self, callback, mock_router, mock_user_auth):
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"minimax": 30.0},
-        )
-
-        error = type("Error", (), {"status_code": 402, "headers": {}})()
-
-        await callback.async_post_call_failure_hook(
-            request_data={"model": "minimax/minimax-m2.7"},
-            original_exception=error,
-            user_api_key_dict=mock_user_auth,
-        )
-        is_limited = await callback._alias_state.is_rate_limited("minimax/minimax-m2.7")
-        assert is_limited is True
-
-    @pytest.mark.asyncio
-    async def test_provider_cooldown_no_match(self, callback, mock_router, mock_user_auth):
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"minimax": 30.0},
-        )
-
-        error = type("Error", (), {"status_code": 402, "headers": {}})()
-
-        await callback.async_post_call_failure_hook(
-            request_data={"model": "unknown-model"},
-            original_exception=error,
-            user_api_key_dict=mock_user_auth,
-        )
-        is_limited = await callback._alias_state.is_rate_limited("unknown-model")
         assert is_limited is True
 
 

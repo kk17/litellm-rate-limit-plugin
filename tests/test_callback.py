@@ -19,12 +19,6 @@ class TestRateLimitCallback:
         callback = RateLimitCallback(default_cooldown_seconds=120.0)
         assert callback.default_cooldown_seconds == 120.0
 
-    def test_init_with_provider_cooldown(self):
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"github-copilot": 600.0, "minimax": 30.0},
-        )
-        assert callback.provider_cooldown_seconds == {"github-copilot": 600.0, "minimax": 30.0}
-
     def test_set_router(self):
         callback = RateLimitCallback()
         router = Mock()
@@ -57,10 +51,8 @@ class TestRateLimitCallback:
         assert is_limited is True
 
     @pytest.mark.asyncio
-    async def test_post_call_failure_402_uses_provider_cooldown(self):
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"github-copilot": 300.0},
-        )
+    async def test_post_call_failure_402_triggers_cooldown(self):
+        callback = RateLimitCallback()
         error = type("Error", (), {"status_code": 402, "headers": {}})()
         request_data = {"model": "github-copilot/claude-opus-4.6"}
         await callback.async_post_call_failure_hook(
@@ -123,38 +115,6 @@ class TestRateLimitCallback:
     def test_get_cooldown_for_model_default(self):
         callback = RateLimitCallback()
         assert callback._get_cooldown_for_model("unknown") == 60.0
-
-    def test_get_cooldown_for_model_with_provider_cooldown(self):
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"github-copilot": 600.0},
-        )
-        assert callback._get_cooldown_for_model("github-copilot/claude-opus-4.6") == 600.0
-        assert callback._get_cooldown_for_model("minimax/m2.5") == 60.0
-
-    def test_get_cooldown_for_model_prefix_match(self):
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"github-copilot": 600.0, "minimax": 30.0},
-        )
-        assert callback._get_cooldown_for_model("openai/gpt-4") == 60.0
-        assert callback._get_cooldown_for_model("minimax-m2.5") == 30.0
-
-    def test_get_cooldown_for_model_from_litellm_params(self):
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"github_copilot": 86400.0},
-        )
-        request_data = {
-            "litellm_params": {"model": "github_copilot/grok-code-fast-1"},
-        }
-        assert callback._get_cooldown_for_model("grok-code-fast-1", request_data) == 86400.0
-
-    def test_get_cooldown_for_model_litellm_params_takes_priority(self):
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"github_copilot": 86400.0, "grok": 60.0},
-        )
-        request_data = {
-            "litellm_params": {"model": "github_copilot/grok-code-fast-1"},
-        }
-        assert callback._get_cooldown_for_model("grok-code-fast-1", request_data) == 86400.0
 
     def test_get_deployment_ids_for_model_no_router(self):
         callback = RateLimitCallback()
@@ -609,18 +569,11 @@ class TestRateLimitCallback:
         assert is_limited is True
 
     def test_get_cooldown_for_model_none_litellm_params(self):
-        """Regression test: _get_cooldown_for_model must handle litellm_params=None."""
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"github_copilot": 86400.0},
-        )
+        callback = RateLimitCallback()
         request_data = {"litellm_params": None}
-        # Should NOT raise AttributeError, should fall back to default
         assert callback._get_cooldown_for_model("gpt-5.1", request_data) == 60.0
 
     def test_get_cooldown_for_model_non_dict_litellm_params(self):
-        """Regression test: _get_cooldown_for_model must handle non-dict litellm_params."""
-        callback = RateLimitCallback(
-            provider_cooldown_seconds={"github_copilot": 86400.0},
-        )
+        callback = RateLimitCallback()
         request_data = {"litellm_params": "not_a_dict"}
         assert callback._get_cooldown_for_model("gpt-5.1", request_data) == 60.0
