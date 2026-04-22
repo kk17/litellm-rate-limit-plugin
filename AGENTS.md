@@ -99,36 +99,32 @@ A LiteLLM Proxy plugin providing intelligent health checking and rate limit hand
 
 ### 6. Provider Probe Config (`src/litellm_rate_limit/provider_probe.py`)
 
-**Purpose**: Share health status across models from the same provider.
+**Purpose**: Configure which models get health-checked and how health status is shared.
 
 **Class**: `ProviderProbeConfig`
 
 **Key Behavior**:
-- Maps model prefixes to probe models
-- First model in config list is the probe model
-- Explicitly listed models get their own health status
-- Unlisted models share the probe model's health status
-- **Config name resolution**: Config names are resolved against both `model_name` and the suffix of `litellm_params.model` (case-insensitive)
+- Only models defined in `models_to_check` are health-checked
+- Each entry maps a probe model to models that share its health status
+- Models not defined in `models_to_check` have unknown status (not health-checked)
 - Maintains `model_name → litellm_model` mapping for health check API calls
 
-**Config Name Resolution**:
-- Config entries like `"MiniMax-M2"` are matched against both:
-  1. Exact `model_name` (e.g., `"minimax-m2"`)
-  2. Suffix of `litellm_params.model` (e.g., `"minimax/Minimax-M2"` → `"Minimax-M2"`) — **case-insensitive**
-- All internal state stores resolved `model_name`s, not config names
-- Unresolved config names fall through to themselves as a fallback
-
-**Example**:
+**Config format**:
 ```yaml
-probe_models_by_provider:
-  minimax: ["MiniMax-M2"]
-  zai: ["glm-4.5-air", "glm-5"]
+models_to_check:
+  - minimax-m2:
+    - minimax-m2
+    - minimax-m2.5
+  - glm-4.5-air:
+    - glm-4.5-air
+    - glm-4.5
+    - glm-4.6
+    - glm-4.7
 ```
 
-- Config `"MiniMax-M2"` resolves to `model_name` `"minimax-m2"` via litellm_model suffix `"minimax/Minimax-M2"`
-- `minimax-m2` health status used for ALL `minimax-*` models
-- `glm-4.5-air` used for unlisted `zai/*` models
-- `glm-5` has its own independent health status
+- `minimax-m2` is health-checked; `minimax-m2.5` shares its health status
+- `glm-4.5-air` is health-checked; `glm-4.5`, `glm-4.6`, `glm-4.7` share its status
+- Models not listed (e.g., `gpt-5.2`) are NOT health-checked (unknown status)
 
 ## Data Flows
 
@@ -210,6 +206,13 @@ rate_limit_plugin:
     interval_seconds: 60
     test_prompt: "Say 'ok'"
     max_latency_ms: 30000
+    models_to_check:
+      - minimax-m2:
+        - minimax-m2
+        - minimax-m2.5
+      - glm-4.5-air:
+        - glm-4.5-air
+        - glm-4.5
 ```
 
 ## Key Design Decisions
@@ -221,7 +224,7 @@ rate_limit_plugin:
 | Track by deployment ID | Same model_name can have multiple deployments |
 | Dataclass-based | Simple, typed, no ORM overhead |
 | AsyncIO locks | Thread-safe state mutations |
-| Config name → model_name resolution | Config can use litellm_model suffix (case-insensitive) to reference models |
+| Explicit models_to_check | Only health-check defined models; undefined models have unknown status |
 | Health check uses litellm_model | API calls need provider-prefixed model string; health state tracks by model_name |
 
 ## Error Handling Patterns

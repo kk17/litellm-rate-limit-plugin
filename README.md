@@ -9,7 +9,7 @@ A plugin for LiteLLM Proxy that provides intelligent health checking and rate li
 - **Smart model blocking** - Temporarily remove rate-limited models from routing until reset
 - **Automatic restoring** - Unblock models when rate limit window expires
 - **Model aliases** - User-friendly alias config with rate limit integration
-- **Provider probe models** - Share health status across models from the same provider
+- **Model health status sharing** - Map models to share health status with a probe model
 
 ## Installation
 
@@ -29,9 +29,13 @@ litellm_settings:
 
 rate_limit_plugin:
   default_cooldown_seconds: 60.0
-  probe_models_by_provider:
-    minimax: ["MiniMax-M2"]
-    glm: ["glm-4.5-air", "glm-5"]
+  models_to_check:
+    - MiniMax-M2:
+        - MiniMax-M2
+        - MiniMax-M2.5
+    - glm-4.5-air:
+        - glm-4.5-air
+        - glm-4.5
 ```
 
 2. Ensure `proxy_handler.py` is in the same directory as your config.yaml (installed with the package).
@@ -112,51 +116,60 @@ rate_limit_plugin:
     timeout_seconds: 30
 ```
 
-### Provider Probe Models
+### Model Health Status Sharing
 
-Share health status across models from the same provider. Useful when multiple models
-share the same backend/API endpoint:
+Configure which models get health-checked and share health status. Each entry specifies a probe model (key) and the list of models (values) that share its health status. Models not listed are NOT health-checked (status: unknown):
 
 ```yaml
 rate_limit_plugin:
   health_check:
-    # Specify probe models per provider
-    # The first model's health status is used for unlisted models with the same prefix
-    probe_models_by_provider:
-      minimax: ["MiniMax-M2"]
-      zai: ["glm-4.5-air", "glm-5"]
-      github-copilot: ["gemini-3-flash-preview", "gpt-4o", "gpt-4.1", "gpt-5-mini"]
+    # Specify model mappings for health status sharing
+    # The key model serves as the probe, values share its health status
+    # Only probe models (keys) are health-checked
+    models_to_check:
+      - MiniMax-M2:
+          - MiniMax-M2
+          - MiniMax-M2.5
+      - glm-4.5-air:
+          - glm-4.5-air
+          - glm-4.5
+      - grok-code-fast-1:
+          - grok-code-fast-1
+          - gpt-5-mini
 ```
 
 **How it works:**
 
-| Config | Probe Model | Explicit Models | Behavior |
-|--------|-------------|-----------------|----------|
-| `minimax: ["MiniMax-M2"]` | `MiniMax-M2` | `MiniMax-M2` | ALL `minimax-*` models share `MiniMax-M2` health status |
-| `zai: ["glm-4.5-air", "glm-5"]` | `glm-4.5-air` | `glm-4.5-air`, `glm-5` | `glm-4.5-air` status used for unlisted `zai` models; `glm-5` has its own status |
+| Config | Probe Model | Shared Models | Behavior |
+|--------|-------------|---------------|----------|
+| `- MiniMax-M2: [MiniMax-M2, MiniMax-M2.5]` | `MiniMax-M2` | `MiniMax-M2`, `MiniMax-M2.5` | Both share `MiniMax-M2` health status |
+| `- glm-4.5-air: [glm-4.5-air, glm-4.5]` | `glm-4.5-air` | `glm-4.5-air`, `glm-4.5` | Both share `glm-4.5-air` health status |
+| (not listed) | N/A | N/A | NOT health-checked (status: unknown) |
 
 **Example:**
 
 ```yaml
-probe_models_by_provider:
-  zai: ["glm-4.5-air", "glm-5"]
+models_to_check:
+  - glm-4.5-air:
+      - glm-4.5-air
+      - glm-4.5
 ```
 
-- `glm-4.5-air` is the probe model (first in list)
-- `glm-5` is explicitly listed, so it gets its own health status
-- `glm-4-plus`, `glm-3-turbo`, etc. (unlisted) will share `glm-4.5-air`'s health status
+- `glm-4.5-air` is the probe model (health-checked)
+- All models in the list (`glm-4.5-air`, `glm-4.5`) share `glm-4.5-air`'s health status
+- Models not listed anywhere are NOT health-checked (status: unknown)
 
 **Programmatic Usage:**
 
 ```python
 from litellm_rate_limit import HealthStateManager, ProviderProbeConfig
 
-# Configure probe models
+# Configure model health status sharing
 probe_config = ProviderProbeConfig(
-    probe_models_by_provider={
-        "minimax": ["MiniMax-M2"],
-        "zai": ["glm-4.5-air", "glm-5"],
-    }
+    models_to_check=[
+        {"MiniMax-M2": ["MiniMax-M2", "MiniMax-M2.5"]},
+        {"glm-4.5-air": ["glm-4.5-air", "glm-4.5"]},
+    ]
 )
 
 # Create health manager with probe config
@@ -165,8 +178,8 @@ health_state = HealthStateManager(provider_probe_config=probe_config)
 # Mark probe model as rate-limited
 await health_state.mark_rate_limited("MiniMax-M2", 60.0)
 
-# All minimax-* models are now blocked
-assert await health_state.is_rate_limited("minimax-abab6.5") is True
+# All models sharing MiniMax-M2 health status are now blocked
+assert await health_state.is_rate_limited("MiniMax-M2.5") is True
 ```
 
 ### Programmatic Usage
@@ -183,12 +196,12 @@ from litellm_rate_limit import (
 )
 
 async def main():
-    # Configure probe models for provider health sharing
+    # Configure model health status sharing
     probe_config = ProviderProbeConfig(
-        probe_models_by_provider={
-            "minimax": ["MiniMax-M2"],
-            "zai": ["glm-4.5-air", "glm-5"],
-        }
+        models_to_check=[
+            {"MiniMax-M2": ["MiniMax-M2", "MiniMax-M2.5"]},
+            {"glm-4.5-air": ["glm-4.5-air", "glm-4.5"]},
+        ]
     )
 
     # Create callback with custom settings

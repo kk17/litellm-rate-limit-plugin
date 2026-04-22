@@ -11,12 +11,8 @@ DEPLOYMENT - Bridge File Pattern (REQUIRED):
         from litellm_rate_limit import RateLimitCallback
         from litellm_rate_limit.config import load_config
 
-        _config = load_config()
-        rate_limit_callback = RateLimitCallback(
-            default_cooldown_seconds=_config["default_cooldown_seconds"],
-            provider_cooldown_seconds=_config.get("provider_cooldown_seconds"),
-            probe_models_by_provider=_config.get("probe_models_by_provider"),
-        )
+        config = load_config()
+        rate_limit_callback = RateLimitCallback.from_config(config)
 
     In config.yaml:
 
@@ -25,13 +21,17 @@ DEPLOYMENT - Bridge File Pattern (REQUIRED):
 
         rate_limit_plugin:
           default_cooldown_seconds: 60.0
-          probe_models_by_provider:
-            minimax: ["minimax-m2"]
+          health_check:
+            enabled: true
+            models_to_check:
+              - minimax-m2:
+                - minimax-m2
+                - minimax-m2.5
 
-    This file (callbacks.py) can be used directly if copied to config directory:
+    This file (rate_limit_plugin.py) can be used directly if copied to config directory:
 
         litellm_settings:
-          callbacks: ["callbacks.rate_limit_callback"]
+          callbacks: ["rate_limit_plugin.callback"]
 """
 
 from litellm_rate_limit import RateLimitCallback

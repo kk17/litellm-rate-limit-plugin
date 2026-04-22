@@ -73,15 +73,15 @@ rate_limit_plugin:
     max_latency_ms: 30000
     # Timeout for individual health checks (seconds)
     timeout_seconds: 30
-    probe_models_by_provider:
-      minimax:
-        - MiniMax-M2
-      zai:
+    models_to_check:
+      - minimax-m2:
+        - minimax-m2
+        - minimax-m2.5
+      - glm-4.5-air:
         - glm-4.5-air
-      github_copilot:
+        - glm-4.5
+      - grok-code-fast-1:
         - grok-code-fast-1
         - gpt-5-mini
-  provider_cooldown_seconds:
-    github_copilot: 86400
-    minimax: 3600
-    zai: 3600
+      - claude-haiku-4.5:
+        - claude-haiku-4.5
