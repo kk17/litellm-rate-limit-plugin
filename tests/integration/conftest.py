@@ -238,6 +238,47 @@ rate_limit_plugin:
   default_cooldown_seconds: 2
 """
 
+_CONFIG_TEMPLATE_ALIAS_FALLBACK = """
+general_settings:
+  master_key: test-master-key
+
+model_list:
+  - model_name: og-qwen3.6-plus
+    litellm_params:
+      model: openai/og-qwen3.6-plus
+      api_key: sk-test-key
+      api_base: http://localhost:8765
+      num_retries: 0
+      request_timeout: 10
+      allowed_fails: 100
+      health_check: false
+
+  - model_name: glm-4.7
+    litellm_params:
+      model: openai/glm-4.7
+      api_key: sk-test-key
+      api_base: http://localhost:8765
+      num_retries: 0
+      request_timeout: 10
+      allowed_fails: 100
+      health_check: false
+
+litellm_settings:
+  callbacks: ["callback_for_test.rate_limit_callback"]
+  num_retries: 0
+  enable_pre_call_checks: true
+
+router_settings:
+  model_group_alias:
+    qwen-3.6-plus: og-qwen3.6-plus
+  fallbacks:
+    - og-qwen3.6-plus:
+        - glm-4.7
+
+rate_limit_plugin:
+  default_cooldown_seconds: 2
+"""
+
 
 def _write_config(config_dir: Path) -> Path:
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -254,6 +295,15 @@ def _write_config_fallback(config_dir: Path) -> Path:
     shutil.copy(callback_src, config_dir / "callback_for_test.py")
     config_path = config_dir / "config.yaml"
     config_path.write_text(_CONFIG_TEMPLATE_FALLBACK)
+    return config_path
+
+
+def _write_config_alias_fallback(config_dir: Path) -> Path:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    callback_src = Path(__file__).parent / "callback_for_test.py"
+    shutil.copy(callback_src, config_dir / "callback_for_test.py")
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(_CONFIG_TEMPLATE_ALIAS_FALLBACK)
     return config_path
 
 
@@ -362,6 +412,20 @@ def per_test_proxy_with_fallback(tmp_path, mock_api_server):
     port = next(_port_counter)
     config_path = _write_config_fallback(tmp_path / "litellm_config_fallback")
     log_file = tmp_path / "proxy_fallback.log"
+    proc = _start_proxy(config_path, port, log_file=log_file)
+    yield {
+        "base_url": f"http://localhost:{port}",
+        "process": proc,
+        "log_file": log_file,
+    }
+    _stop_proxy(proc)
+
+
+@pytest.fixture
+def per_test_proxy_with_alias_fallback(tmp_path, mock_api_server):
+    port = next(_port_counter)
+    config_path = _write_config_alias_fallback(tmp_path / "litellm_config_alias_fallback")
+    log_file = tmp_path / "proxy_alias_fallback.log"
     proc = _start_proxy(config_path, port, log_file=log_file)
     yield {
         "base_url": f"http://localhost:{port}",

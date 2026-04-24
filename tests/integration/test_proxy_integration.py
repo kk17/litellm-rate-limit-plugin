@@ -248,3 +248,91 @@ class TestNoQuotaFallback:
             f"Proxy log (last 100 lines):\n{''.join(log_content.splitlines(keepends=True)[-100:])}"
         )
         assert fallback_calls >= 1, f"Fallback model should be called, got {fallback_calls}"
+
+
+class TestAliasFallback:
+    @pytest.mark.integration
+    def test_429_on_target_triggers_fallback_via_alias(
+        self, per_test_proxy_with_alias_fallback, api_key, mock_api_control
+    ):
+        mock_api_control.rate_limited_models.add("og-qwen3.6-plus")
+
+        status, body = curl_post(
+            f"{per_test_proxy_with_alias_fallback['base_url']}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json_data={
+                "model": "qwen-3.6-plus",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+            timeout=30,
+        )
+        assert status == 200, f"Expected fallback to succeed, got {status}: {body}"
+        data = json.loads(body)
+        assert "choices" in data
+        assert data["model"] == "glm-4.7", f"Expected glm-4.7, got {data.get('model')}"
+
+    @pytest.mark.integration
+    def test_second_alias_request_skips_rate_limited_target(
+        self, per_test_proxy_with_alias_fallback, api_key, mock_api_control
+    ):
+        mock_api_control.rate_limited_models.add("og-qwen3.6-plus")
+        mock_api_control.call_counts.clear()
+
+        status, body = curl_post(
+            f"{per_test_proxy_with_alias_fallback['base_url']}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json_data={
+                "model": "qwen-3.6-plus",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+            timeout=30,
+        )
+        assert status == 200
+        data = json.loads(body)
+        assert data["model"] == "glm-4.7"
+
+        status2, body2 = curl_post(
+            f"{per_test_proxy_with_alias_fallback['base_url']}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json_data={
+                "model": "qwen-3.6-plus",
+                "messages": [{"role": "user", "content": "Hello again"}],
+            },
+            timeout=30,
+        )
+        assert status2 == 200, f"Second request should succeed via fallback, got {status2}: {body2}"
+
+        target_calls = mock_api_control.call_counts.get("og-qwen3.6-plus", 0)
+        fallback_calls = mock_api_control.call_counts.get("glm-4.7", 0)
+
+        log_file = per_test_proxy_with_alias_fallback.get("log_file")
+        log_content = ""
+        if log_file and log_file.exists():
+            log_content = log_file.read_text()
+
+        assert target_calls == 1, (
+            f"Target should be called once (first failed request), got {target_calls}.\n"
+            f"Fallback calls: {fallback_calls}\n"
+            f"All call counts: {dict(mock_api_control.call_counts)}\n"
+            f"Proxy log (last 100 lines):\n{''.join(log_content.splitlines(keepends=True)[-100:])}"
+        )
+        assert fallback_calls >= 2, f"Fallback should be called at least twice, got {fallback_calls}"
+
+    @pytest.mark.integration
+    def test_alias_request_succeeds_when_target_healthy(
+        self, per_test_proxy_with_alias_fallback, api_key, mock_api_control
+    ):
+        mock_api_control.rate_limited_models.discard("og-qwen3.6-plus")
+
+        status, body = curl_post(
+            f"{per_test_proxy_with_alias_fallback['base_url']}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json_data={
+                "model": "qwen-3.6-plus",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+            timeout=30,
+        )
+        assert status == 200, f"Expected success, got {status}: {body}"
+        data = json.loads(body)
+        assert "choices" in data

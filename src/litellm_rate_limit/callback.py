@@ -113,6 +113,7 @@ class RateLimitCallback(CustomLogger):
                         self._router = llm_router
                         self._alias_state.set_router(llm_router)
                         self._build_model_mappings()
+                        self._inject_alias_fallbacks()
 
                         if self._probe_config and hasattr(llm_router, "model_list"):
                             self._probe_config.build_from_router(llm_router.model_list)
@@ -144,6 +145,7 @@ class RateLimitCallback(CustomLogger):
         self._router = router
         self._alias_state.set_router(router)
         self._build_model_mappings()
+        self._inject_alias_fallbacks()
         logger.info("Router reference set")
 
         if self._probe_config and hasattr(router, "model_list"):
@@ -206,7 +208,16 @@ class RateLimitCallback(CustomLogger):
             logger.info("Triggering startup health checks for %d models", len(models))
             await self._run_initial_checks_and_start_periodic(models)
 
-        if await self._health_state.is_rate_limited(model):
+        rate_limited = await self._health_state.is_rate_limited(model)
+
+        if not rate_limited:
+            rate_limited = await self._alias_state.is_rate_limited(model)
+            if rate_limited:
+                resolved = self._alias_state._resolve_to_target(model)
+                if resolved != model:
+                    model = resolved
+
+        if rate_limited:
             logger.info("Model %s is rate-limited, adding to cooldown cache", model)
             await self._sync_health_state_to_cooldown(model, data)
 
@@ -247,6 +258,7 @@ class RateLimitCallback(CustomLogger):
                 self._router = llm_router
                 self._alias_state.set_router(llm_router)
                 self._build_model_mappings()
+                self._inject_alias_fallbacks()
                 logger.info("Router reference obtained from proxy global")
 
                 if self._probe_config and hasattr(llm_router, "model_list"):
@@ -320,7 +332,8 @@ class RateLimitCallback(CustomLogger):
 
         router = self._ensure_router()
         if router is not None:
-            await self._update_cooldown(model, cooldown_seconds, request_data)
+            resolved_model = self._alias_state._resolve_to_target(model)
+            await self._update_cooldown(resolved_model, cooldown_seconds, request_data)
 
     def _get_cooldown_for_model(self, model: str, request_data: dict | None = None) -> float:
         return self.default_cooldown_seconds
@@ -490,6 +503,48 @@ class RateLimitCallback(CustomLogger):
             )
             if litellm_model:
                 self._model_name_to_litellm_model[model_name] = litellm_model
+
+    def _inject_alias_fallbacks(self) -> None:
+        if self._router is None:
+            return
+
+        alias_map = getattr(self._router, "model_group_alias", None)
+        fallbacks = getattr(self._router, "fallbacks", None)
+        if not alias_map or not fallbacks:
+            return
+
+        try:
+            iter(fallbacks)
+        except TypeError:
+            return
+
+        existing_keys = set()
+        for item in fallbacks:
+            if isinstance(item, dict):
+                existing_keys.add(list(item.keys())[0])
+
+        injected = []
+        for alias_name, target in alias_map.items():
+            if isinstance(target, dict):
+                target = target.get("model", alias_name)
+            target_str = str(target)
+
+            if alias_name in existing_keys:
+                continue
+
+            for item in fallbacks:
+                if isinstance(item, dict) and target_str in item:
+                    injected.append({alias_name: item[target_str]})
+                    logger.info(
+                        "Injected alias fallback: %s -> %s (mirrors target %s)",
+                        alias_name,
+                        item[target_str],
+                        target_str,
+                    )
+                    break
+
+        if injected:
+            fallbacks.extend(injected)
 
     def _get_models_to_health_check(self, all_models: list[str]) -> list[str]:
         if not all_models:
