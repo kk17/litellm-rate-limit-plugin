@@ -218,8 +218,13 @@ class RateLimitCallback(CustomLogger):
                     model = resolved
 
         if rate_limited:
-            logger.info("Model %s is rate-limited, adding to cooldown cache", model)
-            await self._sync_health_state_to_cooldown(model, data)
+            resolved = self._alias_state._resolve_to_target(model)
+            logger.info(
+                "Model %s is rate-limited (resolved to %s), adding to cooldown cache",
+                model,
+                resolved,
+            )
+            await self._sync_health_state_to_cooldown(resolved, data)
 
         return data
 
