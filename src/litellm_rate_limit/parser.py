@@ -7,6 +7,8 @@ Supports:
 - x-ratelimit-reset (seconds)
 """
 
+import contextlib
+import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -18,13 +20,32 @@ def detect_api_error(result: Any) -> tuple[bool, int, str] | None:
     if result is None:
         return None
 
-    status_code = getattr(result, "status_code", None)
+    # Check for LiteLLM RouterRateLimitError first (has .status_code but not as int)
+    if hasattr(result, "status_code"):
+        status_code = getattr(result, "status_code", None)
+        code = getattr(result, "code", None)
+        if status_code is None and code is not None:
+            status_code = code
+        if status_code is not None:
+            try:
+                status_int = int(status_code)
+            except (ValueError, TypeError):
+                status_int = None
+            if status_int is not None and status_int >= 400:
+                message = getattr(result, "message", None)
+                if message is None:
+                    message = f"HTTP {status_int}"
+                return (True, status_int, str(message))
+            # Handle RouterRateLimitError which has status_code as a string or code attribute
+            if status_int is None and status_code in (429, "429"):
+                message = getattr(result, "message", "Rate limit exceeded")
+                return (True, 429, str(message))
+
+    # Check for .code attribute (some LiteLLM exceptions use this instead)
     code = getattr(result, "code", None)
-    if status_code is None and code is not None:
-        status_code = code
-    if status_code is not None:
+    if code is not None:
         try:
-            status_int = int(status_code)
+            status_int = int(code)
         except (ValueError, TypeError):
             status_int = None
         if status_int is not None and status_int >= 400:
@@ -32,7 +53,6 @@ def detect_api_error(result: Any) -> tuple[bool, int, str] | None:
             if message is None:
                 message = f"HTTP {status_int}"
             return (True, status_int, str(message))
-        return None
 
     error_response = getattr(result, "response", None)
     if error_response is not None:
@@ -74,6 +94,32 @@ def detect_api_error(result: Any) -> tuple[bool, int, str] | None:
             status_int = 400
         return (True, status_int, message)
 
+    text = str(result)
+    match = re.search(r"Error code:\s*(\d{3})", text)
+    if match:
+        status_int = int(match.group(1))
+        if status_int >= 400:
+            return (True, status_int, text)
+
+    _known_error_status = {
+        "BadRequestError": 400,
+        "UnauthorizedError": 401,
+        "AuthenticationError": 401,
+        "PermissionDeniedError": 403,
+        "ForbiddenError": 403,
+        "NotFoundError": 404,
+        "ConflictError": 409,
+        "UnprocessableEntityError": 422,
+        "RateLimitError": 429,
+        "InternalServerError": 500,
+        "ServiceUnavailableError": 503,
+        "APIConnectionError": 502,
+        "APITimeoutError": 504,
+    }
+    cls_name = type(result).__name__
+    if cls_name in _known_error_status:
+        return (True, _known_error_status[cls_name], text)
+
     return None
 
 
@@ -86,28 +132,82 @@ def is_rate_limit_error(error: Exception) -> bool:
 
 
 def _get_headers_from_error(error: Exception) -> dict:
-    """Extract headers from an exception.
-
-    Args:
-        error: Exception that may contain response headers.
-
-    Returns:
-        Dictionary of headers (lowercase keys).
-    """
     headers = {}
 
-    # Try litellm exception pattern
-    if hasattr(error, "response") and hasattr(error.response, "headers"):
-        headers = dict(error.response.headers)
-    # Try openai exception pattern
-    elif hasattr(error, "headers") and error.headers:
-        headers = dict(error.headers)
-    # Try anthropic exception pattern
-    elif hasattr(error, "_response") and hasattr(error._response, "headers"):
-        headers = dict(error._response.headers)
+    try:
+        if hasattr(error, "response") and hasattr(error.response, "headers"):
+            headers = dict(error.response.headers)
+        elif hasattr(error, "headers") and error.headers:
+            headers = dict(error.headers)
+        elif hasattr(error, "_response") and hasattr(error._response, "headers"):
+            headers = dict(error._response.headers)
+    except (TypeError, AttributeError):
+        pass
 
-    # Normalize header keys to lowercase
     return {k.lower(): v for k, v in headers.items()}
+
+
+def _extract_reset_time_from_message(error: Exception) -> datetime | None:
+    """Extract reset time from error message body.
+
+    Handles non-standard error formats like Zai's:
+    "Usage limit reached for 5 hour. Your limit will reset at 2026-04-25 18:48:34"
+
+    Args:
+        error: Exception that may contain reset time in message.
+
+    Returns:
+        datetime of reset time, or None if not found.
+    """
+    from email.utils import parsedate_to_datetime
+
+    # Try to get message from exception
+    message = None
+
+    # Try different attribute patterns
+    if hasattr(error, "message") and error.message:
+        message = str(error.message)
+    elif hasattr(error, "response"):
+        response = error.response
+        if hasattr(response, "text") and response.text:
+            message = response.text
+        elif hasattr(response, "json"):
+            with contextlib.suppress(BaseException):
+                message = response.json().get("error", {}).get("message")
+
+    if not message and isinstance(error, dict):
+        message = (
+            error.get("error", {}).get("message") if isinstance(error.get("error"), dict) else str(error)
+        )
+
+    if not message:
+        return None
+
+    # Look for patterns such as "reset at 2026-04-25 18:48:34" or "reset at Mon, 25 Apr 2026 18:48:34 GMT"
+
+    patterns = [
+        r"[Rr]eset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",
+        r"[Rr]eset at ([A-Z][a-z]+, \d+ [A-Z][a-z]+ \d+ \d{2}:\d{2}:\d{2} [A-Z]+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, message)
+        if match:
+            date_str = match.group(1)
+            # Try parsing as ISO format first
+            with contextlib.suppress(BaseException):
+                dt = datetime.fromisoformat(date_str.replace(" ", "T"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            # Try RFC 2822 format
+            with contextlib.suppress(BaseException):
+                dt = parsedate_to_datetime(date_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+
+    return None
 
 
 def _parse_anthropic_reset_header(value: str) -> datetime | None:
@@ -210,7 +310,8 @@ def extract_rate_limit_reset_dt(error: Exception) -> datetime | None:
         if reset_dt:
             return reset_dt
 
-    return None
+    # Try to extract from error message body (for non-standard providers like Zai)
+    return _extract_reset_time_from_message(error)
 
 
 def extract_rate_limit_reset_seconds(error: Exception, default: float = DEFAULT_COOLDOWN_SECONDS) -> float:
