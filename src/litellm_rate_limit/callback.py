@@ -41,6 +41,10 @@ class RateLimitCallback(CustomLogger):
         health_check_interval_seconds: int = 60,
         health_check_prompt: str = "Say 'ok'",
         health_check_max_latency_ms: float = 30000.0,
+        log_level: str = "DEBUG",
+        litellm_log_level: str = "INFO",
+        litellm_proxy_log_level: str = "INFO",
+        litellm_router_log_level: str = "INFO",
     ):
         self.default_cooldown_seconds = default_cooldown_seconds
         self._router: LiteLLMRouter | None = None
@@ -63,16 +67,50 @@ class RateLimitCallback(CustomLogger):
 
         health_logger = logging.getLogger("litellm_rate_limit.health_checker")
         provider_logger = logging.getLogger("litellm_rate_limit.provider_probe")
+        config_logger = logging.getLogger("litellm_rate_limit.config")
+        state_logger = logging.getLogger("litellm_rate_limit.health_state")
 
         plugin_logger = logging.getLogger("litellm_rate_limit")
-        if not plugin_logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter("%(levelname)s - %(name)s - %(message)s"))
-            plugin_logger.addHandler(handler)
-        plugin_logger.setLevel(logging.DEBUG)
+        callback_logger = logging.getLogger("litellm_rate_limit.callback")
+        plugin_loggers = [
+            plugin_logger,
+            callback_logger,
+            health_logger,
+            provider_logger,
+            config_logger,
+            state_logger,
+        ]
 
-        for lg in (logger, health_logger, provider_logger):
-            lg.setLevel(logging.DEBUG)
+        litellm_format = (
+            "\033[92m%(asctime)s - %(name)s:%(levelname)s\033[0m: %(filename)s:%(lineno)s - %(message)s"
+        )
+        formatter = logging.Formatter(litellm_format, datefmt="%Y-%m-%d %H:%M:%S")
+
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+
+        for lg in plugin_loggers:
+            lg.handlers.clear()
+            lg.propagate = False
+            lg.addHandler(handler)
+            lg.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+        litellm_main_logger = logging.getLogger("LiteLLM")
+        litellm_main_logger.setLevel(getattr(logging, litellm_log_level.upper(), logging.INFO))
+
+        litellm_proxy_logger = logging.getLogger("LiteLLM Proxy")
+        litellm_proxy_logger.setLevel(getattr(logging, litellm_proxy_log_level.upper(), logging.INFO))
+
+        litellm_router_logger = logging.getLogger("LiteLLM Router")
+        litellm_router_logger.setLevel(getattr(logging, litellm_router_log_level.upper(), logging.INFO))
+
+        litellm_format = (
+            "\033[92m%(asctime)s - %(name)s:%(levelname)s\033[0m: %(filename)s:%(lineno)s - %(message)s"
+        )
+        litellm_formatter = logging.Formatter(litellm_format, datefmt="%Y-%m-%d %H:%M:%S")
+        for lg in (litellm_main_logger, litellm_proxy_logger, litellm_router_logger):
+            for h in lg.handlers:
+                h.setFormatter(litellm_formatter)
 
         if health_check_enabled:
             benchmark = HealthBenchmark(
@@ -98,6 +136,10 @@ class RateLimitCallback(CustomLogger):
             health_check_interval_seconds=config.health_check.interval_seconds,
             health_check_prompt=config.health_check.test_prompt,
             health_check_max_latency_ms=config.health_check.max_latency_ms,
+            log_level=config.logging.log_level,
+            litellm_log_level=config.logging.litellm_log_level,
+            litellm_proxy_log_level=config.logging.litellm_proxy_log_level,
+            litellm_router_log_level=config.logging.litellm_router_log_level,
         )
 
     def _start_router_poll_thread(self) -> None:
@@ -198,7 +240,7 @@ class RateLimitCallback(CustomLogger):
         call_type: str,
     ) -> dict:
         model = data.get("model", "")
-        logger.debug("Pre-call hook for model %s", model)
+        logger.info("Pre-call hook for model %s", model)
 
         self._ensure_router()
 
@@ -244,14 +286,226 @@ class RateLimitCallback(CustomLogger):
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time) -> None:
         exception = kwargs.get("exception")
         if exception is None:
-            return
+            exception = kwargs.get("original_exception")
 
         model = kwargs.get("model", "unknown")
+
+        litellm_params = kwargs.get("litellm_params") or {}
+        litellm_model = litellm_params.get("model", "") if isinstance(litellm_params, dict) else ""
+
+        if litellm_model and model != litellm_model:
+            resolved = self._resolve_model_from_litellm_model(litellm_model)
+            if resolved:
+                logger.debug(
+                    "log_failure_event: resolved model %s -> %s from litellm_model=%s",
+                    model,
+                    resolved,
+                    litellm_model,
+                )
+                model = resolved
+
+        logger.debug(
+            "log_failure_event: model=%s, litellm_model=%s, has_exception=%s",
+            model,
+            litellm_model,
+            exception is not None,
+        )
+
+        if exception is None:
+            return
+
         await self._handle_deployment_failure(
             exception=exception,
             model=model,
             request_data=kwargs,
         )
+
+    async def log_failure_fallback_event(
+        self,
+        original_model_group: str,
+        kwargs: dict,
+        original_exception: Exception,
+    ) -> None:
+        """Called by LiteLLM Router for EACH failed fallback model during fallback chains.
+
+        This hook bypasses the ``has_logged_async_failure`` dedup that blocks
+        ``async_log_failure_event`` for fallback model failures.  It fires once
+        per failed fallback model, giving us the model name in ``kwargs["model"]``.
+        """
+        model = kwargs.get("model", "")
+        if not model:
+            return
+
+        if await self._health_state.is_rate_limited(model):
+            return
+        if await self._alias_state.is_rate_limited(model):
+            return
+
+        logger.info(
+            "Fallback model %s failed (original request: %s), marking unhealthy",
+            model,
+            original_model_group,
+        )
+
+        cooldown_seconds = self._get_cooldown_for_model(model)
+        await self._alias_state.mark_rate_limited(model, cooldown_seconds)
+
+        router = self._ensure_router()
+        if router is not None:
+            resolved_model = self._alias_state._resolve_to_target(model)
+            await self._update_cooldown(resolved_model, cooldown_seconds, kwargs)
+
+    async def log_success_fallback_event(
+        self,
+        original_model_group: str,
+        kwargs: dict,
+        original_exception: Exception,
+    ) -> None:
+        """Called when a fallback chain succeeds.
+
+        Infers which intermediate models in the chain must have failed and marks
+        them unhealthy.  This is a safety-net that catches models missed by
+        ``log_failure_fallback_event``.
+        """
+        successful_model = kwargs.get("model", "")
+        if not successful_model or successful_model == original_model_group:
+            return
+
+        failed_models = self._infer_failed_fallback_models(
+            original_model_group,
+            successful_model,
+        )
+
+        for model in failed_models:
+            if await self._health_state.is_rate_limited(model):
+                continue
+            if await self._alias_state.is_rate_limited(model):
+                continue
+
+            logger.info(
+                "Inferred fallback model %s failed (original: %s, succeeded: %s), marking unhealthy",
+                model,
+                original_model_group,
+                successful_model,
+            )
+
+            cooldown_seconds = self._get_cooldown_for_model(model)
+            await self._alias_state.mark_rate_limited(model, cooldown_seconds)
+
+            router = self._ensure_router()
+            if router is not None:
+                resolved_model = self._alias_state._resolve_to_target(model)
+                await self._update_cooldown(resolved_model, cooldown_seconds)
+
+    def _infer_failed_fallback_models(
+        self,
+        original_model_group: str,
+        successful_model: str,
+    ) -> list[str]:
+        """Return models that must have failed between *original_model_group* and
+        *successful_model* in the fallback chain."""
+        if not self._router:
+            return []
+        fallbacks = getattr(self._router, "fallbacks", None)
+        if not fallbacks:
+            return []
+        for item in fallbacks:
+            if isinstance(item, dict) and original_model_group in item:
+                chain = item[original_model_group]
+                if not isinstance(chain, list):
+                    continue
+                failed: list[str] = []
+                for m in chain:
+                    if m == successful_model:
+                        break
+                    failed.append(m)
+                return failed
+        return []
+
+    async def async_post_call_success_hook(
+        self,
+        data: dict,
+        response: object,
+        user_api_key_dict: UserAPIKeyAuth | None = None,
+    ) -> None:
+        requested_model = data.get("model", "unknown")
+        litellm_params = data.get("litellm_params") or {}
+        model_info = litellm_params.get("model_info") if isinstance(litellm_params, dict) else None
+        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+
+        actual_model = self._resolve_actual_model(
+            data=data,
+            response=response,
+            requested_model=requested_model,
+        )
+
+        if actual_model != requested_model:
+            logger.info(
+                "Successfully called model %s (requested: %s, deployment: %s)",
+                actual_model,
+                requested_model,
+                deployment_id or "unknown",
+            )
+        else:
+            logger.info(
+                "Successfully called model %s (deployment: %s)",
+                actual_model,
+                deployment_id or "unknown",
+            )
+
+    def _resolve_actual_model(
+        self,
+        data: dict,
+        response: object,
+        requested_model: str,
+    ) -> str:
+        """Resolve the actual model name used, handling fallback scenarios.
+
+        Resolution order:
+        1. litellm_params.model in data (direct API call)
+        2. response.model (fallback — contains provider-prefixed actual model)
+        3. deployment_id lookup (fallback — find model_name from router)
+        4. requested_model as-is (no resolution possible)
+        """
+        litellm_params = data.get("litellm_params") or {}
+
+        litellm_model = litellm_params.get("model", "") if isinstance(litellm_params, dict) else ""
+        if litellm_model:
+            resolved = self._resolve_model_from_litellm_model(litellm_model)
+            if resolved:
+                return resolved
+
+        if hasattr(response, "model") and response.model:
+            resolved = self._resolve_model_from_litellm_model(response.model)
+            if resolved:
+                return resolved
+        model_info = litellm_params.get("model_info") if isinstance(litellm_params, dict) else None
+        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+        if deployment_id:
+            model_name = self._get_model_name_for_deployment(deployment_id)
+            if model_name:
+                return model_name
+
+        return requested_model
+
+    def _get_model_name_for_deployment(self, deployment_id: str) -> str | None:
+        """Look up model_name from a deployment ID in the router's model_list."""
+        if not hasattr(self._router, "model_list"):
+            return None
+        for deployment in self._router.model_list:
+            model_info = (
+                deployment.get("model_info", {})
+                if isinstance(deployment, dict)
+                else getattr(deployment, "model_info", {})
+            )
+            dep_id = model_info.get("id") if isinstance(model_info, dict) else getattr(model_info, "id", None)
+            if dep_id == deployment_id:
+                return (
+                    deployment.get("model_name")
+                    if isinstance(deployment, dict)
+                    else getattr(deployment, "model_name", None)
+                )
+        return None
 
     def _ensure_router(self) -> "LiteLLMRouter | None":
         if self._router is not None:
@@ -291,6 +545,14 @@ class RateLimitCallback(CustomLogger):
     async def _handle_deployment_failure(
         self, exception: Exception, model: str, request_data: dict | None = None
     ) -> None:
+        logger.debug(
+            "Handling deployment failure for model %s: exception_type=%s, has_status_code=%s, str=%.200s",
+            model,
+            type(exception).__name__,
+            hasattr(exception, "status_code"),
+            str(exception),
+        )
+
         if isinstance(exception, ProxyException):
             logger.debug(
                 "ProxyException (auth/config error), skipping cooldown for %s: %s",
@@ -414,19 +676,28 @@ class RateLimitCallback(CustomLogger):
         deployment_ids = self._get_deployment_ids_for_model(model)
         if deployment_ids:
             for dep_id in deployment_ids:
+                if self._is_deployment_in_cooldown(dep_id):
+                    logger.info(
+                        "Deployment %s (model %s) already in cooldown, skipping sync",
+                        dep_id,
+                        model,
+                    )
+                    continue
                 self._router.cooldown_cache.add_deployment_to_cooldown(
                     model_id=dep_id,
                     original_exception=Exception("Model rate-limited by health check"),
                     exception_status=429,
                     cooldown_time=cooldown_seconds,
                 )
-                logger.info(
+                logger.debug(
                     "Synced health state to cooldown for deployment %s (model %s): %.1fs",
                     dep_id,
                     model,
                     cooldown_seconds,
                 )
         else:
+            if self._is_deployment_in_cooldown(model):
+                return
             self._router.cooldown_cache.add_deployment_to_cooldown(
                 model_id=model,
                 original_exception=Exception("Model rate-limited by health check"),
@@ -438,6 +709,26 @@ class RateLimitCallback(CustomLogger):
                 model,
                 cooldown_seconds,
             )
+
+    def _is_deployment_in_cooldown(self, deployment_id: str) -> bool:
+        if not hasattr(self._router, "cooldown_cache"):
+            return False
+        get_active = getattr(self._router.cooldown_cache, "get_active_cooldowns", None)
+        if get_active is None:
+            return False
+        active = get_active(
+            model_ids=[deployment_id],
+            parent_otel_span=None,
+        )
+        return bool(active)
+
+    def _resolve_model_from_litellm_model(self, litellm_model: str) -> str | None:
+        if not litellm_model or not self._model_name_to_litellm_model:
+            return None
+        for model_name, ll_model in self._model_name_to_litellm_model.items():
+            if ll_model == litellm_model:
+                return model_name
+        return None
 
     def _get_deployment_ids_for_model(self, model_name: str) -> list[str]:
         if not hasattr(self._router, "model_list"):
