@@ -55,6 +55,9 @@ general_settings:
 rate_limit_plugin:
   # Default cooldown when no reset time in headers
   default_cooldown_seconds: 3600
+  logging:
+    log_level: DEBUG
+    router_log_level: CRITICAL
 
   # Header parsing configuration
   header_parsing:

@@ -45,6 +45,16 @@ class HeaderParsingConfig:
 
 
 @dataclass
+class LoggingConfig:
+    """Logging configuration nested under rate_limit_plugin.logging."""
+
+    log_level: str = "DEBUG"
+    litellm_log_level: str = "INFO"
+    litellm_proxy_log_level: str = "INFO"
+    litellm_router_log_level: str = "INFO"
+
+
+@dataclass
 class RateLimitPluginConfig:
     """Main configuration class for rate limit plugin.
 
@@ -74,6 +84,7 @@ class RateLimitPluginConfig:
     default_cooldown_seconds: float = 60.0
     health_check: HealthCheckConfig = field(default_factory=HealthCheckConfig)
     header_parsing: HeaderParsingConfig = field(default_factory=HeaderParsingConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
 DEFAULT_CONFIG = RateLimitPluginConfig()
@@ -208,6 +219,18 @@ def load_config() -> RateLimitPluginConfig:
                 config.health_check.timeout_seconds = int(hc["timeout_seconds"])
             if "models_to_check" in hc:
                 config.health_check.models_to_check = _normalize_models_to_check(hc["models_to_check"])
+
+    if "logging" in yaml_config:
+        lg = yaml_config["logging"]
+        if isinstance(lg, dict):
+            if "log_level" in lg:
+                config.logging.log_level = str(lg["log_level"])
+            if "litellm_log_level" in lg:
+                config.logging.litellm_log_level = str(lg["litellm_log_level"])
+            if "litellm_proxy_log_level" in lg:
+                config.logging.litellm_proxy_log_level = str(lg["litellm_proxy_log_level"])
+            if "litellm_router_log_level" in lg:
+                config.logging.litellm_router_log_level = str(lg["litellm_router_log_level"])
 
     # Environment variable overrides
     env_cooldown = os.environ.get("RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS")
