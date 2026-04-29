@@ -1,6 +1,7 @@
 """Unit tests for RateLimitCallback."""
 
 import asyncio
+import time
 from unittest.mock import MagicMock, Mock
 
 import pytest
@@ -577,3 +578,133 @@ class TestRateLimitCallback:
         callback = RateLimitCallback()
         request_data = {"litellm_params": "not_a_dict"}
         assert callback._get_cooldown_for_model("gpt-5.1", request_data) == 60.0
+
+    @pytest.mark.asyncio
+    async def test_sync_health_state_uses_remaining_ttl_not_default(self):
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        cooldown_cache = MagicMock()
+        add_mock = Mock()
+        cooldown_cache.add_deployment_to_cooldown = add_mock
+        cooldown_cache.get_active_cooldowns = Mock(return_value=[])
+
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-123"}},
+        ]
+        callback.set_router(router)
+
+        await callback._health_state.mark_rate_limited("glm-5.1", 5.0)
+
+        await callback._sync_health_state_to_cooldown("glm-5.1")
+
+        add_mock.assert_called_once()
+        call_kwargs = add_mock.call_args[1]
+        assert call_kwargs["cooldown_time"] < 6.0, (
+            f"Expected cooldown_time close to 5.0s (remaining), got {call_kwargs['cooldown_time']}"
+        )
+        assert call_kwargs["cooldown_time"] >= 4.0, (
+            f"Expected cooldown_time >= 4.0s (remaining minus drift), got {call_kwargs['cooldown_time']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sync_health_state_falls_back_to_default_when_no_health_entry(self):
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        cooldown_cache = MagicMock()
+        add_mock = Mock()
+        cooldown_cache.add_deployment_to_cooldown = add_mock
+        cooldown_cache.get_active_cooldowns = Mock(return_value=[])
+
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-123"}},
+        ]
+        callback.set_router(router)
+
+        await callback._sync_health_state_to_cooldown("glm-5.1")
+
+        add_mock.assert_called_once()
+        call_kwargs = add_mock.call_args[1]
+        assert call_kwargs["cooldown_time"] == 60.0
+
+    @pytest.mark.asyncio
+    async def test_sync_uses_alias_state_remaining_when_health_state_has_none(self):
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        cooldown_cache = MagicMock()
+        add_mock = Mock()
+        cooldown_cache.add_deployment_to_cooldown = add_mock
+        cooldown_cache.get_active_cooldowns = Mock(return_value=[])
+
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-123"}},
+        ]
+        callback.set_router(router)
+
+        await callback._alias_state.mark_rate_limited("glm-5.1", 10.0)
+
+        await callback._sync_health_state_to_cooldown("glm-5.1")
+
+        add_mock.assert_called_once()
+        call_kwargs = add_mock.call_args[1]
+        assert call_kwargs["cooldown_time"] < 11.0
+        assert call_kwargs["cooldown_time"] >= 9.0
+
+    @pytest.mark.asyncio
+    async def test_cooldown_auto_resumes_after_expiry(self):
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+
+        router = Mock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-123"}},
+        ]
+        callback.set_router(router)
+
+        await callback._health_state.mark_rate_limited("glm-5.1", 1.0)
+
+        data = {"model": "glm-5.1"}
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=Mock(),
+            cache=Mock(),
+            data=data,
+            call_type="completion",
+        )
+        assert result == data
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1
+
+        await asyncio.sleep(1.1)
+
+        is_limited = await callback._health_state.is_rate_limited("glm-5.1")
+        assert is_limited is False
+
+        _cooldown_entries.clear()
+        data2 = {"model": "glm-5.1"}
+        result2 = await callback.async_pre_call_hook(
+            user_api_key_dict=Mock(),
+            cache=Mock(),
+            data=data2,
+            call_type="completion",
+        )
+        assert result2 == data2
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1, (
+            "Should NOT re-add to cooldown after rate limit expired"
+        )

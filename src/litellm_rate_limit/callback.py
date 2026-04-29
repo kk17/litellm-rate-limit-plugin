@@ -671,7 +671,12 @@ class RateLimitCallback(CustomLogger):
         if self._router is None or not hasattr(self._router, "cooldown_cache"):
             return
 
-        cooldown_seconds = self._get_cooldown_for_model(model, request_data)
+        remaining = self._health_state.get_remaining_cooldown(model)
+        if remaining is None:
+            remaining = self._alias_state.get_remaining_cooldown(model)
+        cooldown_seconds = (
+            remaining if remaining is not None else self._get_cooldown_for_model(model, request_data)
+        )
 
         deployment_ids = self._get_deployment_ids_for_model(model)
         if deployment_ids:

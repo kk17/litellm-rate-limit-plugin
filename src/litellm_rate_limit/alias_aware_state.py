@@ -107,6 +107,14 @@ class AliasAwareHealthState:
                 del self._rate_limited_targets[k]
             return dict(self._rate_limited_targets)
 
+    def get_remaining_cooldown(self, model_name: str) -> float | None:
+        target = self._resolve_to_target(model_name)
+        entry = self._rate_limited_targets.get(target)
+        if entry is None:
+            return None
+        remaining = entry.until_monotonic - time.monotonic()
+        return max(0.0, remaining)
+
     async def clear_all(self) -> None:
         async with self._lock:
             self._rate_limited_targets.clear()

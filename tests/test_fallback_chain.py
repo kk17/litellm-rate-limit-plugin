@@ -84,7 +84,7 @@ class TestPreCallHookNoRaise:
 
         call_args = cb._router.cooldown_cache.add_deployment_to_cooldown.call_args
         assert call_args[1]["model_id"] == "dep-gpt-5.1"
-        assert call_args[1]["cooldown_time"] == 3600.0
+        assert call_args[1]["cooldown_time"] == pytest.approx(3600.0, abs=0.1)
 
     @pytest.mark.asyncio
     async def test_healthy_model_no_cooldown(self):

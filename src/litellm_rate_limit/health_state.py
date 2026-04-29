@@ -181,6 +181,14 @@ class HealthStateManager:
                     last_check_time=time.monotonic(),
                 )
 
+    def get_remaining_cooldown(self, model_id: str) -> float | None:
+        """Return the remaining cooldown seconds for a model, or None if not rate-limited."""
+        effective_model = self._get_effective_model(model_id)
+        if effective_model not in self._rate_limited_until:
+            return None
+        remaining = self._rate_limited_until[effective_model] - time.monotonic()
+        return max(0.0, remaining)
+
     async def clear_all(self) -> None:
         async with self._lock:
             self._rate_limited_until.clear()
