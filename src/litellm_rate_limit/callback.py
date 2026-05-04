@@ -270,7 +270,6 @@ class RateLimitCallback(CustomLogger):
         call_type: str,
     ) -> dict:
         original_model = data.get("model", "")
-        logger.info("Pre-call hook for model %s (alias: %s)", original_model, original_model)
 
         self._ensure_router()
 
@@ -285,8 +284,6 @@ class RateLimitCallback(CustomLogger):
 
         if not rate_limited:
             rate_limited = await self._alias_state.is_rate_limited(original_model)
-            if rate_limited:
-                resolved_target = self._alias_state._resolve_to_target(original_model)
 
         if rate_limited:
             resolved_target = self._alias_state._resolve_to_target(original_model)
@@ -515,43 +512,12 @@ class RateLimitCallback(CustomLogger):
         # Fall back to litellm_params model_info for deployment_id
         model_info = litellm_params.get("model_info") if isinstance(litellm_params, dict) else None
         deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+        if deployment_id:
+            resolved_model_name = self._get_model_name_for_deployment(deployment_id)
+            if resolved_model_name:
+                return resolved_model_name, deployment_id
 
         return requested_model, deployment_id
-
-    def _resolve_actual_model(
-        self,
-        data: dict,
-        response: object,
-        requested_model: str,
-    ) -> str:
-        """Resolve the actual model name used, handling fallback scenarios.
-
-        Resolution order:
-        1. litellm_params.model in data (direct API call)
-        2. response.model (fallback — contains provider-prefixed actual model)
-        3. deployment_id lookup (fallback — find model_name from router)
-        4. requested_model as-is (no resolution possible)
-        """
-        litellm_params = data.get("litellm_params") or {}
-
-        litellm_model = litellm_params.get("model", "") if isinstance(litellm_params, dict) else ""
-        if litellm_model:
-            resolved = self._resolve_model_from_litellm_model(litellm_model)
-            if resolved:
-                return resolved
-
-        if hasattr(response, "model") and response.model:
-            resolved = self._resolve_model_from_litellm_model(response.model)
-            if resolved:
-                return resolved
-        model_info = litellm_params.get("model_info") if isinstance(litellm_params, dict) else None
-        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
-        if deployment_id:
-            model_name = self._get_model_name_for_deployment(deployment_id)
-            if model_name:
-                return model_name
-
-        return requested_model
 
     def _get_deployment_id_for_model(self, model_name: str) -> str | None:
         """Look up deployment ID for a given model name in the router's model_list."""
