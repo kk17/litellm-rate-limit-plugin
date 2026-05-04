@@ -293,6 +293,11 @@ class RateLimitCallback(CustomLogger):
                 resolved_target,
             )
             await self._sync_health_state_to_cooldown(resolved_target, data)
+        else:
+            # Model is healthy – ensure any stale cooldown_cache entries
+            # (left over from a previous rate-limit period) are removed so
+            # LiteLLM Router can route requests to this model again.
+            await self._remove_from_cooldown_cache(original_model)
 
         return data
 
@@ -792,6 +797,47 @@ class RateLimitCallback(CustomLogger):
             parent_otel_span=None,
         )
         return bool(active)
+
+    async def _remove_from_cooldown_cache(self, model: str) -> None:
+        """Remove model from LiteLLM cooldown_cache when it's no longer rate-limited.
+
+        This is necessary because LiteLLM Router's cooldown_cache may still have
+        stale entries after the plugin's health state auto-restores.  Without this
+        cleanup the Router will keep skipping the model even though the plugin
+        considers it healthy.
+        """
+        if self._router is None or not hasattr(self._router, "cooldown_cache"):
+            return
+
+        deployment_ids = self._get_deployment_ids_for_model(model)
+
+        targets = deployment_ids if deployment_ids else [model]
+        for target_id in targets:
+            if not self._is_deployment_in_cooldown(target_id):
+                continue
+
+            removed_method = getattr(self._router.cooldown_cache, "remove_deployment_from_cooldown", None)
+            if removed_method is not None:
+                removed_method(target_id)
+                logger.info(
+                    "Removed stale cooldown cache entry for %s (model %s)",
+                    target_id,
+                    model,
+                )
+            else:
+                # Fallback: overwrite with a near-zero cooldown so LiteLLM
+                # expires it on the next check.
+                self._router.cooldown_cache.add_deployment_to_cooldown(
+                    model_id=target_id,
+                    original_exception=Exception("Rate limit expired – auto-restored"),
+                    exception_status=429,
+                    cooldown_time=0.01,
+                )
+                logger.info(
+                    "Overwrote stale cooldown cache entry for %s (model %s) with near-zero TTL",
+                    target_id,
+                    model,
+                )
 
     def _resolve_model_from_litellm_model(self, litellm_model: str) -> str | None:
         if not litellm_model or not self._model_name_to_litellm_model:

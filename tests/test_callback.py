@@ -10,6 +10,11 @@ from litellm_rate_limit.callback import RateLimitCallback
 from litellm_rate_limit.parser import DEFAULT_COOLDOWN_SECONDS
 
 
+def _is_entry_active(entries: dict[str, float], key: str) -> bool:
+    """Check if a mock cooldown_cache entry is still active (not expired)."""
+    return key in entries and time.monotonic() < entries[key]
+
+
 class TestRateLimitCallback:
     def test_init_default_values(self):
         callback = RateLimitCallback()
@@ -1361,3 +1366,245 @@ class TestCooldownCacheAutoRestore:
         # Should auto-restore
         is_limited = await callback._alias_state.is_rate_limited("glm-5.1")
         assert is_limited is False
+
+    @pytest.mark.asyncio
+    async def test_stale_cooldown_cache_removed_on_auto_restore(self):
+        """After health state auto-restores, stale cooldown_cache entries are removed.
+
+        This is the core fix for issue #0027: when the plugin's health state says a
+        model is healthy again, any lingering LiteLLM cooldown_cache entries must be
+        cleared so the Router will route requests to the model.
+
+        We simulate the real scenario where LiteLLM's cooldown_cache has a LONGER
+        TTL than the plugin's health state (e.g. LiteLLM keeps the entry for 60s
+        while the plugin auto-restores after just 1s).
+        """
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        mock_remove = Mock()
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+        cooldown_cache.remove_deployment_from_cooldown = mock_remove
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-glm-5.1"}},
+        ]
+        router.model_group_alias = {}
+        callback.set_router(router)
+
+        # Mark rate limited with SHORT duration in plugin health state (1s)
+        await callback._alias_state.mark_rate_limited("glm-5.1", 1.0)
+
+        # Manually add a LONGER-lived entry to LiteLLM's cooldown_cache (60s)
+        # to simulate LiteLLM's own cooldown being longer than the plugin's.
+        _cooldown_entries["dep-glm-5.1"] = time.monotonic() + 60.0
+
+        # Wait for plugin health state to expire (1s)
+        await asyncio.sleep(1.1)
+
+        # The LiteLLM cooldown_cache entry is still active (60s TTL)
+        assert _is_entry_active(_cooldown_entries, "dep-glm-5.1")
+
+        # Pre-call hook should detect model as healthy (plugin auto-restored)
+        # but the LiteLLM cooldown_cache still has a stale entry → must clean it up
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data={"model": "glm-5.1"},
+            call_type="completion",
+        )
+
+        # The stale entry should have been removed
+        mock_remove.assert_called_with("dep-glm-5.1")
+
+    @pytest.mark.asyncio
+    async def test_stale_cooldown_cleared_without_remove_method(self):
+        """Fallback: if remove_deployment_from_cooldown is unavailable, overwrite with near-zero TTL."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+        # No remove_deployment_from_cooldown method – use fallback path
+        del cooldown_cache.remove_deployment_from_cooldown
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-glm-5.1"}},
+        ]
+        router.model_group_alias = {}
+        callback.set_router(router)
+
+        # Mark rate limited with SHORT duration in plugin health state (1s)
+        await callback._alias_state.mark_rate_limited("glm-5.1", 1.0)
+
+        # Manually add a LONGER-lived entry to LiteLLM's cooldown_cache (60s)
+        _cooldown_entries["dep-glm-5.1"] = time.monotonic() + 60.0
+
+        # Wait for plugin health state to expire
+        await asyncio.sleep(1.1)
+
+        # LiteLLM cooldown_cache still active
+        assert _is_entry_active(_cooldown_entries, "dep-glm-5.1")
+
+        # Pre-call hook should overwrite the stale entry with near-zero TTL
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data={"model": "glm-5.1"},
+            call_type="completion",
+        )
+
+        # Should have called add_deployment_to_cooldown again with near-zero cooldown
+        last_call = cooldown_cache.add_deployment_to_cooldown.call_args_list[-1]
+        assert last_call[1]["cooldown_time"] <= 0.1
+        assert last_call[1]["model_id"] == "dep-glm-5.1"
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_zai_rate_limit_auto_restore(self):
+        """End-to-end test: ZAI rate limit error triggers cooldown, then auto-restores.
+
+        Simulates the exact scenario from issue #0027:
+        1. Model gets ZAI rate limit error (429 with reset time in message)
+        2. Model is correctly rate-limited
+        3. After rate limit period passes, model auto-restores
+        4. Stale cooldown_cache entry is cleaned up
+        """
+        from datetime import datetime, timedelta, timezone
+
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        mock_remove = Mock()
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+        cooldown_cache.remove_deployment_from_cooldown = mock_remove
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-glm-5.1"}},
+        ]
+        router.model_group_alias = {}
+        callback.set_router(router)
+
+        # Simulate ZAI rate limit error (HTTP 429 with reset time in message)
+        future_reset = datetime.now(timezone.utc) + timedelta(seconds=2)
+        reset_str = future_reset.strftime("%Y-%m-%d %H:%M:%S")
+        error = type(
+            "Error",
+            (),
+            {
+                "status_code": 429,
+                "headers": {},
+                "message": f"Error code: 429 - {{'error': {{'code': '1308', 'message': 'Usage limit reached for 5 hour. Your limit will reset at {reset_str}'}}}}",
+            },
+        )()
+
+        request_data = {"model": "glm-5.1"}
+        await callback.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=error,
+        )
+
+        # Model should be rate-limited
+        is_limited = await callback._alias_state.is_rate_limited("glm-5.1")
+        assert is_limited is True
+
+        # Pre-call should sync to cooldown cache
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data={"model": "glm-5.1"},
+            call_type="completion",
+        )
+        assert "dep-glm-5.1" in _cooldown_entries
+
+        # Simulate: LiteLLM's cooldown_cache has a LONGER TTL (e.g., LiteLLM
+        # set its own 60s cooldown on top of the plugin's ~2s cooldown).
+        # We overwrite the entry to have a much longer TTL.
+        _cooldown_entries["dep-glm-5.1"] = time.monotonic() + 60.0
+
+        # Wait for the plugin's rate limit period to expire (2s + buffer)
+        await asyncio.sleep(2.5)
+
+        # Model should auto-restore in plugin health state
+        is_limited = await callback._alias_state.is_rate_limited("glm-5.1")
+        assert is_limited is False, "Model should auto-restore after rate limit expires"
+
+        # But the LiteLLM cooldown_cache entry is still active
+        assert _is_entry_active(_cooldown_entries, "dep-glm-5.1")
+
+        # Pre-call should clean up the stale cooldown cache entry
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data={"model": "glm-5.1"},
+            call_type="completion",
+        )
+
+        # Stale cooldown should be removed
+        mock_remove.assert_called_with("dep-glm-5.1")
+
+    @pytest.mark.asyncio
+    async def test_remove_from_cooldown_cache_noop_when_not_in_cooldown(self):
+        """_remove_from_cooldown_cache should be a no-op if model is not in cooldown."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        mock_remove = Mock()
+        cooldown_cache = MagicMock()
+        cooldown_cache.get_active_cooldowns = Mock(return_value=[])
+        cooldown_cache.remove_deployment_from_cooldown = mock_remove
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-glm-5.1"}},
+        ]
+        callback.set_router(router)
+
+        # Model was never rate-limited, so cooldown cache has no entries
+        await callback._remove_from_cooldown_cache("glm-5.1")
+
+        # Should NOT try to remove (nothing to remove)
+        mock_remove.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_remove_from_cooldown_cache_noop_without_router(self):
+        """_remove_from_cooldown_cache should be a no-op if no router is set."""
+        callback = RateLimitCallback()
+        # No router set – should not raise
+        await callback._remove_from_cooldown_cache("glm-5.1")
