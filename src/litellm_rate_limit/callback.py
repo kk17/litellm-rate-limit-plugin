@@ -270,6 +270,7 @@ class RateLimitCallback(CustomLogger):
         call_type: str,
     ) -> dict:
         original_model = data.get("model", "")
+        logger.info("Pre-call hook for model %s (alias: %s)", original_model, original_model)
 
         self._ensure_router()
 
