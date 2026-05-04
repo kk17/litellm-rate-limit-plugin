@@ -10,3 +10,4 @@ dist/
 htmlcov/
 config.yaml
 test.sh
+*.env
