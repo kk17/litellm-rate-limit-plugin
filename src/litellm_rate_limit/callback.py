@@ -770,42 +770,43 @@ class RateLimitCallback(CustomLogger):
 
         cooldown_seconds = remaining
 
-        deployment_ids = self._get_deployment_ids_for_model(model)
-        if deployment_ids:
-            for dep_id in deployment_ids:
-                if self._is_deployment_in_cooldown(dep_id):
-                    logger.info(
-                        "Deployment %s (model %s) already in cooldown, skipping sync",
+        async with self._cooldown_cache_lock:
+            deployment_ids = self._get_deployment_ids_for_model(model)
+            if deployment_ids:
+                for dep_id in deployment_ids:
+                    if self._is_deployment_in_cooldown(dep_id):
+                        logger.info(
+                            "Deployment %s (model %s) already in cooldown, skipping sync",
+                            dep_id,
+                            model,
+                        )
+                        continue
+                    self._router.cooldown_cache.add_deployment_to_cooldown(
+                        model_id=dep_id,
+                        original_exception=Exception("Model rate-limited by health check"),
+                        exception_status=429,
+                        cooldown_time=cooldown_seconds,
+                    )
+                    logger.debug(
+                        "Synced health state to cooldown for deployment %s (model %s): %.1fs",
                         dep_id,
                         model,
+                        cooldown_seconds,
                     )
-                    continue
+            else:
+                if self._is_deployment_in_cooldown(model):
+                    return
                 self._router.cooldown_cache.add_deployment_to_cooldown(
-                    model_id=dep_id,
+                    model_id=model,
                     original_exception=Exception("Model rate-limited by health check"),
                     exception_status=429,
                     cooldown_time=cooldown_seconds,
                 )
-                logger.debug(
-                    "Synced health state to cooldown for deployment %s (model %s): %.1fs",
-                    dep_id,
+                logger.info(
+                    "Synced health state to cooldown for model %s (fallback): %.1fs",
                     model,
                     cooldown_seconds,
                 )
-        else:
-            if self._is_deployment_in_cooldown(model):
-                return
-            self._router.cooldown_cache.add_deployment_to_cooldown(
-                model_id=model,
-                original_exception=Exception("Model rate-limited by health check"),
-                exception_status=429,
-                cooldown_time=cooldown_seconds,
-            )
-            logger.info(
-                "Synced health state to cooldown for model %s (fallback): %.1fs",
-                model,
-                cooldown_seconds,
-            )
 
     def _is_deployment_in_cooldown(self, deployment_id: str) -> bool:
         if not hasattr(self._router, "cooldown_cache"):
