@@ -270,9 +270,14 @@ class RateLimitCallback(CustomLogger):
         call_type: str,
     ) -> dict:
         original_model = data.get("model", "")
-        logger.info("Pre-call hook for model %s (alias: %s)", original_model, original_model)
-
         self._ensure_router()
+
+        # Resolve alias to show target model in log
+        resolved_target = self._alias_state._resolve_to_target(original_model)
+        if resolved_target != original_model:
+            logger.info("Pre-call hook for model %s (alias for: %s)", original_model, resolved_target)
+        else:
+            logger.info("Pre-call hook for model %s", original_model)
 
         if self._startup_models:
             models = self._startup_models

@@ -875,6 +875,73 @@ class TestOriginalModelNameLogging:
         assert mock_is_limited.call_args[0][0] == "claude-sonnet-4-6"
 
     @pytest.mark.asyncio
+    async def test_pre_call_hook_log_shows_alias_for_target(self):
+        """Pre-call log for an alias model should show 'alias for: <target>'."""
+        from unittest.mock import MagicMock, patch
+
+        router = MagicMock()
+        router.model_list = []
+        router.model_group_alias = {"claude-sonnet-4-6": "a-glm-4.7"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+
+        data = {"model": "claude-sonnet-4-6"}
+
+        with patch("litellm_rate_limit.callback.logger") as mock_logger:
+            await callback.async_pre_call_hook(
+                user_api_key_dict=MagicMock(),
+                cache=MagicMock(),
+                data=data,
+                call_type="completion",
+            )
+
+            info_calls = list(mock_logger.info.call_args_list)
+            pre_call_log = next(
+                (c for c in info_calls if "Pre-call hook for model" in str(c)),
+                None,
+            )
+            assert pre_call_log is not None, "Should have logged pre-call hook message"
+            # Check the actual log arguments, not the format string
+            args = pre_call_log[0]
+            assert args[0] == "Pre-call hook for model %s (alias for: %s)"
+            assert args[1] == "claude-sonnet-4-6", "Should show original model name"
+            assert args[2] == "a-glm-4.7", f"Should show resolved target 'a-glm-4.7', got: {args[2]}"
+
+    @pytest.mark.asyncio
+    async def test_pre_call_hook_log_no_alias_for_direct_model(self):
+        """Pre-call log for a direct (non-alias) model should NOT mention alias."""
+        from unittest.mock import MagicMock, patch
+
+        router = MagicMock()
+        router.model_list = []
+        router.model_group_alias = {"claude-sonnet-4-6": "a-glm-4.7"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+
+        data = {"model": "gemini-3.1-pro-preview"}
+
+        with patch("litellm_rate_limit.callback.logger") as mock_logger:
+            await callback.async_pre_call_hook(
+                user_api_key_dict=MagicMock(),
+                cache=MagicMock(),
+                data=data,
+                call_type="completion",
+            )
+
+            info_calls = list(mock_logger.info.call_args_list)
+            pre_call_log = next(
+                (c for c in info_calls if "Pre-call hook for model" in str(c)),
+                None,
+            )
+            assert pre_call_log is not None, "Should have logged pre-call hook message"
+            args = pre_call_log[0]
+            assert args[0] == "Pre-call hook for model %s"
+            assert args[1] == "gemini-3.1-pro-preview", "Should show model name"
+            assert len(args) == 2, f"Should NOT have alias info for direct model, got args: {args}"
+
+    @pytest.mark.asyncio
     async def test_async_post_call_success_logs_requested_model_not_alias(self):
         """Verify success hook logs the requested model, not the resolved one."""
         router = MagicMock()
