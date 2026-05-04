@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -1493,8 +1494,6 @@ class TestCooldownCacheAutoRestore:
         3. After rate limit period passes, model auto-restores
         4. Stale cooldown_cache entry is cleaned up
         """
-        from datetime import datetime, timedelta, timezone
-
         callback = RateLimitCallback(default_cooldown_seconds=60.0)
 
         _cooldown_entries: dict[str, float] = {}

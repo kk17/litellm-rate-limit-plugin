@@ -809,9 +809,11 @@ class RateLimitCallback(CustomLogger):
         if self._router is None or not hasattr(self._router, "cooldown_cache"):
             return
 
-        deployment_ids = self._get_deployment_ids_for_model(model)
+        # Resolve alias to target model so deployment lookup works correctly
+        resolved_model = self._alias_state._resolve_to_target(model)
+        deployment_ids = self._get_deployment_ids_for_model(resolved_model)
 
-        targets = deployment_ids if deployment_ids else [model]
+        targets = deployment_ids if deployment_ids else [resolved_model]
         for target_id in targets:
             if not self._is_deployment_in_cooldown(target_id):
                 continue
@@ -822,7 +824,7 @@ class RateLimitCallback(CustomLogger):
                 logger.info(
                     "Removed stale cooldown cache entry for %s (model %s)",
                     target_id,
-                    model,
+                    resolved_model,
                 )
             else:
                 # Fallback: overwrite with a near-zero cooldown so LiteLLM
@@ -836,7 +838,7 @@ class RateLimitCallback(CustomLogger):
                 logger.info(
                     "Overwrote stale cooldown cache entry for %s (model %s) with near-zero TTL",
                     target_id,
-                    model,
+                    resolved_model,
                 )
 
     def _resolve_model_from_litellm_model(self, litellm_model: str) -> str | None:
