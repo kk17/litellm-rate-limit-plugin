@@ -708,3 +708,114 @@ class TestRateLimitCallback:
         assert cooldown_cache.add_deployment_to_cooldown.call_count == 1, (
             "Should NOT re-add to cooldown after rate limit expired"
         )
+
+
+class TestPeriodicHealthCheckPersistence:
+    """Tests for issue #0024: Health check should run periodically, not just once.
+
+    The previous implementation closed the event loop immediately after initial
+    checks completed, preventing periodic health checks from running.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_initial_checks_and_start_periodic_creates_running_task(self):
+        """Verify that initial checks start the periodic health check task."""
+        from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
+
+        runner = HealthCheckRunner(benchmark=HealthBenchmark())
+
+        call_count = 0
+
+        async def counting_client(model_id: str, prompt: str):
+            nonlocal call_count
+            call_count += 1
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        # Run initial checks and start periodic
+        await runner.run_initial_checks_and_start_periodic(
+            models=["model-a", "model-b"],
+            interval_seconds=0.05,
+            health_manager=None,
+            client=counting_client,
+            cooldown_seconds=60.0,
+        )
+
+        # After initial checks, the periodic task should be running
+        assert runner.is_running("startup") is True, (
+            "Periodic health check task should be running after initial checks complete"
+        )
+
+        # Wait for at least one more iteration
+        await asyncio.sleep(0.15)
+
+        # Should have at least 2 calls (initial + at least one periodic)
+        assert call_count >= 2, (
+            f"Expected at least 2 health check calls, got {call_count}. "
+            "This indicates periodic checks are not running."
+        )
+
+        await runner.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_health_check_task_runs_multiple_iterations(self):
+        """Test that the health check task runs for multiple iterations."""
+        from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
+
+        runner = HealthCheckRunner(benchmark=HealthBenchmark())
+
+        call_count = 0
+
+        async def counting_client(model_id: str, prompt: str):
+            nonlocal call_count
+            call_count += 1
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        await runner.run_initial_checks_and_start_periodic(
+            models=["model-x"],
+            interval_seconds=0.1,
+            health_manager=None,
+            client=counting_client,
+            cooldown_seconds=60.0,
+        )
+
+        # Wait for multiple iterations
+        await asyncio.sleep(0.35)
+
+        # Should have multiple calls
+        assert call_count >= 3, (
+            f"Expected at least 3 health check calls in 0.35s with 0.1s interval, got {call_count}. "
+            "Periodic checks may not be running."
+        )
+
+        await runner.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_health_runner_multiple_models_periodic(self):
+        """Test periodic checks with multiple models."""
+        from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
+
+        runner = HealthCheckRunner(benchmark=HealthBenchmark())
+
+        calls = {"model-a": 0, "model-b": 0}
+
+        async def tracking_client(model_id: str, prompt: str):
+            calls[model_id] = calls.get(model_id, 0) + 1
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        await runner.run_initial_checks_and_start_periodic(
+            models=["model-a", "model-b"],
+            interval_seconds=0.1,
+            health_manager=None,
+            client=tracking_client,
+            cooldown_seconds=60.0,
+        )
+
+        await asyncio.sleep(0.35)
+
+        for model, count in calls.items():
+            assert count >= 3, (
+                f"Expected at least 3 health checks for {model}, got {count}. "
+                "Periodic checks may not be running for all models."
+            )
+
+        await runner.stop_all()

@@ -66,6 +66,7 @@ class RateLimitCallback(CustomLogger):
         self._health_checks_started = False
         self._startup_models: list[str] | None = None
         self._startup_thread: threading.Thread | None = None
+        self._health_check_loop: asyncio.AbstractEventLoop | None = None
 
         health_logger = logging.getLogger("litellm_rate_limit.health_checker")
         provider_logger = logging.getLogger("litellm_rate_limit.provider_probe")
@@ -169,12 +170,18 @@ class RateLimitCallback(CustomLogger):
                             try:
                                 loop = asyncio.new_event_loop()
                                 asyncio.set_event_loop(loop)
+                                self._health_check_loop = loop
+                                future = loop.create_future()
                                 loop.run_until_complete(
-                                    self._run_initial_checks_and_start_periodic(model_names)
+                                    self._run_initial_checks_and_start_periodic_async(model_names, future)
                                 )
-                                loop.close()
+                                # Keep the loop running to support periodic health checks
+                                loop.run_forever()
                             except Exception as e:
                                 logger.error("Failed to run startup health checks: %s", e)
+                                if loop.is_running():
+                                    loop.stop()
+                                loop.close()
                         return
                 except ImportError:
                     pass
@@ -233,6 +240,53 @@ class RateLimitCallback(CustomLogger):
             cooldown_seconds=self.default_cooldown_seconds,
         )
         logger.info("Completed startup health checks for %d models", len(models_to_check))
+
+    async def _run_initial_checks_and_start_periodic_async(
+        self,
+        model_names: list[str],
+        initial_done_future: asyncio.Future | None = None,
+    ) -> None:
+        """Run initial health checks and start periodic checks.
+
+        When initial_done_future is provided, it will be set when initial checks complete,
+        but the periodic checks will continue running indefinitely (until stopped).
+        """
+        if self._health_runner is None:
+            logger.warning("Health runner not initialized, skipping startup health checks")
+            if initial_done_future and not initial_done_future.done():
+                initial_done_future.set_result(None)
+            return
+        if not model_names:
+            logger.warning("No models to health check at startup")
+            if initial_done_future and not initial_done_future.done():
+                initial_done_future.set_result(None)
+            return
+
+        models_to_check = (
+            self._probe_config.get_models_to_health_check(model_names) if self._probe_config else model_names
+        )
+        logger.info(
+            "Running startup health checks for %d models (reduced from %d via probe config)",
+            len(models_to_check),
+            len(model_names),
+        )
+        client = self._get_health_check_client()
+        await self._health_runner.run_initial_checks_and_start_periodic(
+            models=models_to_check,
+            interval_seconds=self._health_check_interval,
+            health_manager=self._health_state,
+            client=client,
+            cooldown_seconds=self.default_cooldown_seconds,
+        )
+        logger.info("Completed startup health checks for %d models", len(models_to_check))
+
+        # Signal that initial checks are done (but periodic checks continue)
+        if initial_done_future and not initial_done_future.done():
+            initial_done_future.set_result(None)
+
+        # Block forever to keep the periodic health checks running
+        if self._health_check_loop and self._health_check_loop.is_running():
+            await self._health_check_loop.create_future()
 
     async def async_pre_call_hook(
         self,
