@@ -286,7 +286,6 @@ class RateLimitCallback(CustomLogger):
             await self._run_initial_checks_and_start_periodic(models, None)
 
         rate_limited = await self._health_state.is_rate_limited(original_model)
-        resolved_target = original_model
 
         if not rate_limited:
             rate_limited = await self._alias_state.is_rate_limited(original_model)
