@@ -1,6 +1,6 @@
 """Test parsing reset time from error messages."""
 
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 
 from litellm_rate_limit.parser import (
     _extract_reset_time_from_message,
@@ -13,26 +13,39 @@ class MockError:
         self.message = message
 
 
+def make_future_message(template: str, hours_ahead: int = 24) -> tuple[str, datetime]:
+    """Generate a message with a future datetime and return both the message and expected datetime."""
+    future_dt = datetime.now(timezone.utc) + timedelta(hours=hours_ahead)
+    date_str = future_dt.strftime("%Y-%m-%d %H:%M:%S")
+    return template.format(date_str=date_str), future_dt
+
+
 class TestExtractResetTimeFromMessage:
     def test_zai_format(self):
-        error = MockError("Usage limit reached for 5 hour. Your limit will reset at 2026-04-25 18:48:34")
+        msg, expected_dt = make_future_message(
+            "Usage limit reached for 5 hour. Your limit will reset at {date_str}"
+        )
+        error = MockError(msg)
         result = _extract_reset_time_from_message(error)
 
         assert result is not None
-        assert result.year == 2026
-        assert result.month == 4
-        assert result.day == 25
-        assert result.hour == 18
-        assert result.minute == 48
-        assert result.second == 34
+        assert result.year == expected_dt.year
+        assert result.month == expected_dt.month
+        assert result.day == expected_dt.day
+        assert result.hour == expected_dt.hour
+        assert result.minute == expected_dt.minute
+        assert result.second == expected_dt.second
         assert result.tzinfo == timezone.utc
 
     def test_rfc2822_format(self):
-        error = MockError("Rate limit exceeded. Reset at Mon, 25 Apr 2026 18:48:34 GMT")
+        future_dt = datetime.now(timezone.utc) + timedelta(hours=24)
+        date_str = future_dt.strftime("%d %b %Y %H:%M:%S")
+        msg = f"Rate limit exceeded. Reset at Mon, {date_str} GMT"
+        error = MockError(msg)
         result = _extract_reset_time_from_message(error)
 
         assert result is not None
-        assert result.year == 2026
+        assert result.year == future_dt.year
         assert result.tzinfo == timezone.utc
 
     def test_no_reset_time(self):
@@ -42,15 +55,21 @@ class TestExtractResetTimeFromMessage:
         assert result is None
 
     def test_extract_seconds(self):
-        error = MockError("Usage limit reached for 5 hour. Your limit will reset at 2026-04-25 18:48:34")
+        """Test that extract_rate_limit_reset_seconds returns parsed value, not default."""
+        # Use 2 hours ahead to ensure we get a predictable value
+        msg, _ = make_future_message(
+            "Usage limit reached for 5 hour. Your limit will reset at {date_str}", hours_ahead=2
+        )
+        error = MockError(msg)
         seconds = extract_rate_limit_reset_seconds(error, default=3600)
 
-        # Should parse the reset time, not use default
+        # Should parse the reset time (around 2 hours = 7200 seconds), not use default (3600)
         assert seconds != 3600
-        assert seconds > 0
+        assert 7000 < seconds < 7500  # Approximately 2 hours
 
     def test_naive_datetime_has_utc(self):
-        error = MockError("reset at 2026-04-25 18:48:34")
+        msg, _ = make_future_message("reset at {date_str}")
+        error = MockError(msg)
         result = _extract_reset_time_from_message(error)
 
         assert result is not None
