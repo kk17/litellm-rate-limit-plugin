@@ -737,11 +737,12 @@ class RateLimitCallback(CustomLogger):
             return
 
         remaining = self._health_state.get_remaining_cooldown(model)
-        if remaining is None:
+        if remaining is None or remaining <= 0:
             remaining = self._alias_state.get_remaining_cooldown(model)
-        cooldown_seconds = (
-            remaining if remaining is not None else self._get_cooldown_for_model(model, request_data)
-        )
+        if remaining is None or remaining <= 0:
+            return
+
+        cooldown_seconds = remaining
 
         deployment_ids = self._get_deployment_ids_for_model(model)
         if deployment_ids:

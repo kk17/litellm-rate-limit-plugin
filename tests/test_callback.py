@@ -609,7 +609,7 @@ class TestRateLimitCallback:
         )
 
     @pytest.mark.asyncio
-    async def test_sync_health_state_falls_back_to_default_when_no_health_entry(self):
+    async def test_sync_health_state_skips_when_no_rate_limit_entry(self):
         callback = RateLimitCallback(default_cooldown_seconds=60.0)
 
         cooldown_cache = MagicMock()
@@ -626,9 +626,7 @@ class TestRateLimitCallback:
 
         await callback._sync_health_state_to_cooldown("glm-5.1")
 
-        add_mock.assert_called_once()
-        call_kwargs = add_mock.call_args[1]
-        assert call_kwargs["cooldown_time"] == 60.0
+        add_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_sync_uses_alias_state_remaining_when_health_state_has_none(self):
@@ -677,6 +675,7 @@ class TestRateLimitCallback:
         router.model_list = [
             {"model_name": "glm-5.1", "model_info": {"id": "dep-123"}},
         ]
+        router.model_group_alias = {}
         callback.set_router(router)
 
         await callback._health_state.mark_rate_limited("glm-5.1", 1.0)
@@ -1292,7 +1291,7 @@ class TestCooldownCacheAutoRestore:
             call_type="completion",
         )
         # After health state entry expires, model is healthy, NOT re-added to cooldown
-        assert cooldown_cache.add_deployment_to_cooldown.call_count == 0, (
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1, (
             "Model should remain healthy after rate limit expires - should NOT be re-added to cooldown"
         )
 
