@@ -44,6 +44,10 @@ class HealthStateManager:
     # Back-reference to AliasAwareHealthState for cross-state synchronization
     _alias_state: "AliasAwareHealthState | None" = None
 
+    def set_alias_state(self, alias_state: "AliasAwareHealthState | None") -> None:
+        """Set the alias state reference for cross-state synchronization."""
+        self._alias_state = alias_state
+
     def _get_effective_model(self, model_id: str) -> str:
         if self.provider_probe_config is None:
             return model_id
@@ -200,3 +204,8 @@ class HealthStateManager:
                 status.is_rate_limited = False
                 status.rate_limited_until = None
                 status.rate_limit_reset_at = None
+
+    async def clear_alias_state(self, model_id: str) -> None:
+        """Clear rate limit from alias_state if wired."""
+        if self._alias_state is not None:
+            await self._alias_state.clear_rate_limit(model_id)

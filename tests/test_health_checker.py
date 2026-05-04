@@ -364,19 +364,21 @@ class TestHealthCheckClearsAliasState:
         health_state = HealthStateManager()
         alias_state = AliasAwareHealthState()
         # Wire the back-reference
-        health_state._alias_state = alias_state
+        health_state.set_alias_state(alias_state)
 
         benchmark = HealthBenchmark()
         stop_event = asyncio.Event()
 
         # Simulate: first call fails (unhealthy), second call succeeds (healthy)
         call_count = 0
+        healthy_event = asyncio.Event()
 
         async def flaky_client(model_id: str, prompt: str):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise RuntimeError("Service unavailable")
+            healthy_event.set()
             return {"choices": [{"message": {"content": "ok"}}]}
 
         task = asyncio.create_task(
@@ -390,8 +392,8 @@ class TestHealthCheckClearsAliasState:
             )
         )
 
-        # Wait for at least 2 health check cycles
-        await asyncio.sleep(0.2)
+        # Wait deterministically for the healthy check to complete
+        await asyncio.wait_for(healthy_event.wait(), timeout=2.0)
         stop_event.set()
 
         with contextlib.suppress(asyncio.CancelledError):
@@ -409,7 +411,7 @@ class TestHealthCheckClearsAliasState:
 
         health_state = HealthStateManager()
         alias_state = AliasAwareHealthState()
-        health_state._alias_state = alias_state
+        health_state.set_alias_state(alias_state)
 
         runner = HealthCheckRunner()
 
