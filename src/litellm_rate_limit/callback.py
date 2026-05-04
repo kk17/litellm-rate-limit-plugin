@@ -269,8 +269,8 @@ class RateLimitCallback(CustomLogger):
         data: dict,
         call_type: str,
     ) -> dict:
-        model = data.get("model", "")
-        logger.info("Pre-call hook for model %s", model)
+        original_model = data.get("model", "")
+        logger.info("Pre-call hook for model %s (alias: %s)", original_model, original_model)
 
         self._ensure_router()
 
@@ -280,23 +280,22 @@ class RateLimitCallback(CustomLogger):
             logger.info("Triggering startup health checks for %d models", len(models))
             await self._run_initial_checks_and_start_periodic(models, None)
 
-        rate_limited = await self._health_state.is_rate_limited(model)
+        rate_limited = await self._health_state.is_rate_limited(original_model)
+        resolved_target = original_model
 
         if not rate_limited:
-            rate_limited = await self._alias_state.is_rate_limited(model)
+            rate_limited = await self._alias_state.is_rate_limited(original_model)
             if rate_limited:
-                resolved = self._alias_state._resolve_to_target(model)
-                if resolved != model:
-                    model = resolved
+                resolved_target = self._alias_state._resolve_to_target(original_model)
 
         if rate_limited:
-            resolved = self._alias_state._resolve_to_target(model)
+            resolved_target = self._alias_state._resolve_to_target(original_model)
             logger.info(
                 "Model %s is rate-limited (resolved to %s), adding to cooldown cache",
-                model,
-                resolved,
+                original_model,
+                resolved_target,
             )
-            await self._sync_health_state_to_cooldown(resolved, data)
+            await self._sync_health_state_to_cooldown(resolved_target, data)
 
         return data
 
@@ -459,11 +458,8 @@ class RateLimitCallback(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth | None = None,
     ) -> None:
         requested_model = data.get("model", "unknown")
-        litellm_params = data.get("litellm_params") or {}
-        model_info = litellm_params.get("model_info") if isinstance(litellm_params, dict) else None
-        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
 
-        actual_model = self._resolve_actual_model(
+        actual_model, deployment_id = self._resolve_actual_model_with_deployment(
             data=data,
             response=response,
             requested_model=requested_model,
@@ -482,6 +478,45 @@ class RateLimitCallback(CustomLogger):
                 actual_model,
                 deployment_id or "unknown",
             )
+
+    def _resolve_actual_model_with_deployment(
+        self,
+        data: dict,
+        response: object,
+        requested_model: str,
+    ) -> tuple[str, str | None]:
+        """Resolve the actual model name used and its deployment ID, handling fallback scenarios.
+
+        Resolution order:
+        1. litellm_params.model in data (direct API call)
+        2. response.model (fallback — contains provider-prefixed actual model)
+        3. deployment_id lookup (fallback — find model_name and deployment from router)
+        4. requested_model as-is (no resolution possible)
+
+        Returns:
+            tuple of (actual_model_name, deployment_id)
+        """
+        litellm_params = data.get("litellm_params") or {}
+
+        litellm_model = litellm_params.get("model", "") if isinstance(litellm_params, dict) else ""
+        if litellm_model:
+            resolved = self._resolve_model_from_litellm_model(litellm_model)
+            if resolved:
+                # Get deployment ID for the resolved model
+                deployment_id = self._get_deployment_id_for_model(resolved)
+                return resolved, deployment_id
+
+        if hasattr(response, "model") and response.model:
+            resolved = self._resolve_model_from_litellm_model(response.model)
+            if resolved:
+                deployment_id = self._get_deployment_id_for_model(resolved)
+                return resolved, deployment_id
+
+        # Fall back to litellm_params model_info for deployment_id
+        model_info = litellm_params.get("model_info") if isinstance(litellm_params, dict) else None
+        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+
+        return requested_model, deployment_id
 
     def _resolve_actual_model(
         self,
@@ -517,6 +552,28 @@ class RateLimitCallback(CustomLogger):
                 return model_name
 
         return requested_model
+
+    def _get_deployment_id_for_model(self, model_name: str) -> str | None:
+        """Look up deployment ID for a given model name in the router's model_list."""
+        if not hasattr(self._router, "model_list"):
+            return None
+        for deployment in self._router.model_list:
+            model_name_in_deployment = (
+                deployment.get("model_name")
+                if isinstance(deployment, dict)
+                else getattr(deployment, "model_name", None)
+            )
+            if model_name_in_deployment != model_name:
+                continue
+            model_info = (
+                deployment.get("model_info", {})
+                if isinstance(deployment, dict)
+                else getattr(deployment, "model_info", {})
+            )
+            dep_id = model_info.get("id") if isinstance(model_info, dict) else getattr(model_info, "id", None)
+            if dep_id:
+                return dep_id
+        return None
 
     def _get_model_name_for_deployment(self, deployment_id: str) -> str | None:
         """Look up model_name from a deployment ID in the router's model_list."""

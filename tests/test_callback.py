@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from unittest.mock import MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -829,3 +829,123 @@ class TestPeriodicHealthCheckPersistence:
             )
 
         await runner.stop_all()
+
+
+class TestOriginalModelNameLogging:
+    """Tests for issue #0025: Wired model name in invocation chain.
+
+    When processing a request for alias model (e.g., `claude-sonnet-4-6`), the
+    logs should show the original model name (`claude-sonnet-4-6`) rather than
+    the resolved target model name (`a-glm-4.7`).
+    """
+
+    @pytest.mark.asyncio
+    async def test_pre_call_hook_preserves_original_model_name_in_log(self):
+        """Verify that pre-call hook uses original model name, not resolved alias."""
+        from unittest.mock import MagicMock, patch
+
+        router = MagicMock()
+        router.model_list = []
+        router.model_group_alias = {"claude-sonnet-4-6": "a-glm-4.7"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+
+        data = {"model": "claude-sonnet-4-6"}
+
+        with patch.object(
+            callback._alias_state, "is_rate_limited", new_callable=AsyncMock
+        ) as mock_is_limited:
+            mock_is_limited.return_value = True
+            result = await callback.async_pre_call_hook(
+                user_api_key_dict=MagicMock(),
+                cache=MagicMock(),
+                data=data,
+                call_type="completion",
+            )
+
+        assert result == data
+        # The original model name should be preserved
+        assert mock_is_limited.call_args[0][0] == "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_async_post_call_success_logs_requested_model_not_alias(self):
+        """Verify success hook logs the requested model, not the resolved one."""
+        router = MagicMock()
+        router.model_list = [
+            {"model_name": "a-minimax-m2.5", "model_info": {"id": "dep-minimax"}},
+        ]
+        router.model_group_alias = {"claude-sonnet-4-6": "a-minimax-m2.5"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {"a-minimax-m2.5": "minimax/MiniMax-M2.5"}
+
+        response = MagicMock()
+        response.model = "minimax/MiniMax-M2.5"
+
+        data = {
+            "model": "claude-sonnet-4-6",
+            "litellm_params": {},
+        }
+
+        with patch("litellm_rate_limit.callback.logger") as mock_logger:
+            await callback.async_post_call_success_hook(
+                data=data,
+                response=response,
+                user_api_key_dict=MagicMock(),
+            )
+
+            # The log should show the actual model used (a-minimax-m2.5) since it's different from requested
+            info_calls = list(mock_logger.info.call_args_list)
+            success_call = next(
+                (c for c in info_calls if "Successfully called model" in str(c)),
+                None,
+            )
+            assert success_call is not None, "Should have logged success message"
+            # The actual model should be logged, not the alias
+            assert "a-minimax-m2.5" in str(success_call)
+
+    @pytest.mark.asyncio
+    async def test_get_deployment_id_for_model_returns_correct_id(self):
+        """Test that _get_deployment_id_for_model correctly returns deployment ID."""
+        router = MagicMock()
+        router.model_list = [
+            {"model_name": "a-glm-4.7", "model_info": {"id": "dep-glm-47"}},
+            {"model_name": "a-minimax-m2.5", "model_info": {"id": "dep-minimax"}},
+        ]
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+
+        assert callback._get_deployment_id_for_model("a-glm-4.7") == "dep-glm-47"
+        assert callback._get_deployment_id_for_model("a-minimax-m2.5") == "dep-minimax"
+        assert callback._get_deployment_id_for_model("unknown") is None
+
+    @pytest.mark.asyncio
+    async def test_resolve_actual_model_with_deployment_returns_tuple(self):
+        """Test that _resolve_actual_model_with_deployment returns (model, deployment_id)."""
+        router = MagicMock()
+        router.model_list = [
+            {"model_name": "a-glm-4.7", "model_info": {"id": "dep-glm-47"}},
+        ]
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {"a-glm-4.7": "zai/glm-4.7"}
+
+        response = MagicMock()
+
+        # Test with litellm_model mapping
+        data = {
+            "model": "a-glm-4.7",
+            "litellm_params": {"model": "zai/glm-4.7"},
+        }
+
+        result = callback._resolve_actual_model_with_deployment(
+            data=data,
+            response=response,
+            requested_model="a-glm-4.7",
+        )
+
+        assert result == ("a-glm-4.7", "dep-glm-47")
