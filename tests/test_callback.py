@@ -1294,6 +1294,152 @@ class TestResolveActualModelFallbackPath:
             )
             assert "dep-minimax" in str(success_call), f"Expected 'dep-minimax' in log, got: {success_call}"
 
+    @pytest.mark.asyncio
+    async def test_alias_resolved_to_target_when_no_other_resolution(self):
+        """When response.model equals requested alias and no deployment ID, resolve via alias.
+
+        Simulates the real-world scenario: user requests `gemini-3.1-pro` (alias for
+        `gemini-3.1-pro-preview`). LiteLLM returns response.model as the alias name.
+        No model_info.id is available. The method should resolve the alias to the
+        target model and find its deployment.
+        """
+        router = MagicMock()
+        router.model_list = [
+            {
+                "model_name": "gemini-3.1-pro-preview",
+                "model_info": {"id": "dep-gemini-preview"},
+                "litellm_params": {"model": "vertex/gemini-3.1-pro-preview"},
+            },
+        ]
+        router.model_group_alias = {"gemini-3.1-pro": "gemini-3.1-pro-preview"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {
+            "gemini-3.1-pro-preview": "vertex/gemini-3.1-pro-preview",
+        }
+
+        # response.model equals the alias (same as requested_model)
+        response = MagicMock()
+        response.model = "gemini-3.1-pro"
+
+        data = {
+            "model": "gemini-3.1-pro",
+            "litellm_params": {},
+        }
+
+        result = callback._resolve_actual_model_with_deployment(
+            data=data,
+            response=response,
+            requested_model="gemini-3.1-pro",
+        )
+
+        # Should resolve alias to target model and get deployment ID
+        assert result[0] == "gemini-3.1-pro-preview", f"Expected 'gemini-3.1-pro-preview', got '{result[0]}'"
+        assert result[1] == "dep-gemini-preview", f"Expected 'dep-gemini-preview', got '{result[1]}'"
+
+    @pytest.mark.asyncio
+    async def test_alias_success_hook_logs_target_model_not_alias(self):
+        """End-to-end: success hook should log target model, not alias, even with no deployment ID.
+
+        When `gemini-3.1-pro` (alias for `gemini-3.1-pro-preview`) succeeds and
+        response.model is the alias, the log should show the target model name.
+        """
+        router = MagicMock()
+        router.model_list = [
+            {
+                "model_name": "gemini-3.1-pro-preview",
+                "model_info": {"id": "dep-gemini-preview"},
+                "litellm_params": {"model": "vertex/gemini-3.1-pro-preview"},
+            },
+        ]
+        router.model_group_alias = {"gemini-3.1-pro": "gemini-3.1-pro-preview"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {
+            "gemini-3.1-pro-preview": "vertex/gemini-3.1-pro-preview",
+        }
+
+        response = MagicMock()
+        response.model = "gemini-3.1-pro"
+
+        data = {
+            "model": "gemini-3.1-pro",
+            "litellm_params": {},
+        }
+
+        with patch("litellm_rate_limit.callback.logger") as mock_logger:
+            await callback.async_post_call_success_hook(
+                data=data,
+                response=response,
+                user_api_key_dict=MagicMock(),
+            )
+
+            info_calls = list(mock_logger.info.call_args_list)
+            success_call = next(
+                (c for c in info_calls if "Successfully called model" in str(c)),
+                None,
+            )
+            assert success_call is not None, "Should have logged success message"
+            # Should log target model, not alias
+            assert "gemini-3.1-pro-preview" in str(success_call), (
+                f"Expected 'gemini-3.1-pro-preview' in log, got: {success_call}"
+            )
+            assert "dep-gemini-preview" in str(success_call), (
+                f"Expected 'dep-gemini-preview' in log, got: {success_call}"
+            )
+            # Should NOT show the alias
+            log_str = str(success_call)
+            # The log should NOT be "Successfully called model gemini-3.1-pro"
+            assert "model gemini-3.1-pro," not in log_str, (
+                f"Should NOT log alias 'gemini-3.1-pro' as the actual model, got: {log_str}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_fallback_no_litellm_params_resolves_via_alias(self):
+        """Fallback with no litellm_params and response.model as alias resolves to actual model.
+
+        When `claude-sonnet-4-6` (alias for `a-glm-4.7`) falls back to `a-k2p5`,
+        and response.model is the alias, but litellm_params.model_info.id is not available,
+        the method should still try to resolve the alias. If the alias resolves to a target
+        that has deployment(s), return the target and deployment ID.
+        """
+        router = MagicMock()
+        router.model_list = [
+            {
+                "model_name": "a-k2p5",
+                "model_info": {"id": "dep-k2p5"},
+                "litellm_params": {"model": "k2/k2p5"},
+            },
+        ]
+        router.model_group_alias = {"claude-sonnet-4-6": "a-k2p5"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {
+            "a-k2p5": "k2/k2p5",
+        }
+
+        # response.model is the alias (doesn't resolve via litellm_model mapping)
+        response = MagicMock()
+        response.model = "claude-sonnet-4-6"
+
+        data = {
+            "model": "claude-sonnet-4-6",
+            "litellm_params": {},  # No model_info.id
+        }
+
+        result = callback._resolve_actual_model_with_deployment(
+            data=data,
+            response=response,
+            requested_model="claude-sonnet-4-6",
+        )
+
+        # Should resolve alias to target model and get deployment
+        assert result[0] == "a-k2p5", f"Expected 'a-k2p5', got '{result[0]}'"
+        assert result[1] == "dep-k2p5", f"Expected 'dep-k2p5', got '{result[1]}'"
+
 
 class TestCooldownCacheAutoRestore:
     """Tests for issue #0027: Rate limited model cannot be removed from cooldown.

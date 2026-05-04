@@ -538,7 +538,17 @@ class RateLimitCallback(CustomLogger):
             if resolved_model_name:
                 return resolved_model_name, deployment_id
 
-        # Step 4: No resolution possible — return requested model as-is
+        # Step 4: Try resolving via alias — requested_model may be an alias whose
+        # target has deployments in the router's model_list.
+        resolved_target = self._alias_state._resolve_to_target(requested_model)
+        if resolved_target != requested_model:
+            deployment_id = self._get_deployment_id_for_model(resolved_target)
+            if deployment_id:
+                return resolved_target, deployment_id
+            # Target resolved but no deployment found — still return target name
+            return resolved_target, None
+
+        # Step 5: No resolution possible — return requested model as-is
         return requested_model, None
 
     def _get_deployment_id_for_model(self, model_name: str) -> str | None:
