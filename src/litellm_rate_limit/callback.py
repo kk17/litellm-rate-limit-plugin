@@ -498,7 +498,8 @@ class RateLimitCallback(CustomLogger):
         1. litellm_params.model in data (direct API call)
         2. response.model (fallback — contains provider-prefixed actual model)
         3. deployment_id lookup via litellm_params.model_info.id
-        4. requested_model as-is (no resolution possible)
+        4. Alias resolution for requested_model
+        5. requested_model as-is (no resolution possible)
 
         Returns:
             tuple of (actual_model_name, deployment_id)
