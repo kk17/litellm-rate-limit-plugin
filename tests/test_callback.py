@@ -949,3 +949,416 @@ class TestOriginalModelNameLogging:
         )
 
         assert result == ("a-glm-4.7", "dep-glm-47")
+
+
+class TestResolveActualModelFallbackPath:
+    """Tests for issue #0026: Final call model is not correct in logging.
+
+    When LiteLLM falls back to a different model, the success hook should
+    log the actual model used, not the original requested model. The
+    resolution uses the response.model field which contains the provider-prefixed
+    model name of the actual model called.
+    """
+
+    @pytest.mark.asyncio
+    async def test_resolve_uses_response_model_when_litellm_params_not_in_mapping(self):
+        """Test that response.model is used when litellm_params.model is not in mapping."""
+        router = MagicMock()
+        router.model_list = [
+            {"model_name": "a-minimax-m2.5", "model_info": {"id": "dep-minimax"}},
+        ]
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        # litellm_model mapping is empty - can't resolve from litellm_params
+        callback._model_name_to_litellm_model = {}
+
+        # Simulate a fallback response with provider-prefixed model
+        response = MagicMock()
+        response.model = "minimax/MiniMax-M2.5"
+
+        data = {
+            "model": "claude-sonnet-4-6",  # Original requested model (alias)
+            "litellm_params": {"model": "claude-sonnet-4-6"},  # May not be in mapping
+        }
+
+        # Add the REVERSE mapping (litellm_model -> model_name) for response model resolution
+        # This is needed because _resolve_model_from_litellm_model looks up by litellm_model value
+        callback._model_name_to_litellm_model = {"a-minimax-m2.5": response.model}
+
+        result = callback._resolve_actual_model_with_deployment(
+            data=data,
+            response=response,
+            requested_model="claude-sonnet-4-6",
+        )
+
+        # Should resolve to a-minimax-m2.5 using response.model and get deployment ID
+        assert result == ("a-minimax-m2.5", "dep-minimax")
+
+    @pytest.mark.asyncio
+    async def test_success_hook_logs_actual_fallback_model(self):
+        """Test that async_post_call_success_hook logs actual model after fallback."""
+        router = MagicMock()
+        router.model_list = [
+            {"model_name": "a-glm-4.7", "model_info": {"id": "dep-glm-47"}},
+            {"model_name": "a-minimax-m2.5", "model_info": {"id": "dep-minimax"}},
+        ]
+        router.model_group_alias = {"claude-sonnet-4-6": "a-minimax-m2.5"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {
+            "a-minimax-m2.5": "minimax/MiniMax-M2.5",
+        }
+
+        # Response from fallback model
+        response = MagicMock()
+        response.model = "minimax/MiniMax-M2.5"
+
+        data = {
+            "model": "claude-sonnet-4-6",  # Original requested (alias)
+            "litellm_params": {"model": "claude-sonnet-4-6"},
+        }
+
+        with patch("litellm_rate_limit.callback.logger") as mock_logger:
+            await callback.async_post_call_success_hook(
+                data=data,
+                response=response,
+                user_api_key_dict=MagicMock(),
+            )
+
+            # Should log the actual fallback model, not the original requested
+            info_calls = list(mock_logger.info.call_args_list)
+            success_call = next(
+                (c for c in info_calls if "Successfully called model" in str(c)),
+                None,
+            )
+            assert success_call is not None, "Should have logged success message"
+            # The actual model (a-minimax-m2.5) should be logged
+            assert "a-minimax-m2.5" in str(success_call)
+            # The deployment ID should be shown, not "unknown"
+            assert "dep-minimax" in str(success_call)
+
+    @pytest.mark.asyncio
+    async def test_response_model_equals_requested_but_deployment_id_resolves(self):
+        """Regression test: response.model == requested_model should NOT return early.
+
+        When a fallback happens but response.model equals the original requested
+        model name (e.g. both are the alias "claude-sonnet-4-6"), the method should
+        NOT return the alias as the actual model. Instead it should fall through to
+        try litellm_params.model_info.id which can resolve the real model.
+        """
+        router = MagicMock()
+        router.model_list = [
+            {"model_name": "a-glm-4.7", "model_info": {"id": "dep-glm-47"}},
+            {"model_name": "a-minimax-m2.5", "model_info": {"id": "dep-minimax"}},
+        ]
+        router.model_group_alias = {"claude-sonnet-4-6": "a-glm-4.7"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {
+            "a-glm-4.7": "zai/glm-4.7",
+            "a-minimax-m2.5": "minimax/MiniMax-M2.5",
+        }
+
+        # response.model equals the alias (same as requested_model) — doesn't resolve
+        response = MagicMock()
+        response.model = "claude-sonnet-4-6"
+
+        # litellm_params has model_info.id pointing to the fallback deployment
+        data = {
+            "model": "claude-sonnet-4-6",
+            "litellm_params": {
+                "model_info": {"id": "dep-minimax"},
+            },
+        }
+
+        result = callback._resolve_actual_model_with_deployment(
+            data=data,
+            response=response,
+            requested_model="claude-sonnet-4-6",
+        )
+
+        # Should resolve via model_info.id, NOT return the alias
+        assert result[0] == "a-minimax-m2.5", f"Expected actual model a-minimax-m2.5, got {result[0]}"
+        assert result[1] == "dep-minimax", f"Expected deployment dep-minimax, got {result[1]}"
+
+    @pytest.mark.asyncio
+    async def test_response_model_as_model_name_gets_deployment_id(self):
+        """Test that response.model is tried as a model_name to get deployment ID.
+
+        When response.model contains a model_name (not a litellm_model), it should
+        look up the deployment ID directly from the router's model_list.
+        """
+        router = MagicMock()
+        router.model_list = [
+            {"model_name": "a-minimax-m2.5", "model_info": {"id": "dep-minimax"}},
+        ]
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        # No litellm_model mapping — response.model is a model_name, not a litellm_model
+        callback._model_name_to_litellm_model = {}
+
+        response = MagicMock()
+        response.model = "a-minimax-m2.5"
+
+        data = {
+            "model": "claude-sonnet-4-6",
+            "litellm_params": {},
+        }
+
+        result = callback._resolve_actual_model_with_deployment(
+            data=data,
+            response=response,
+            requested_model="claude-sonnet-4-6",
+        )
+
+        assert result == ("a-minimax-m2.5", "dep-minimax")
+
+    @pytest.mark.asyncio
+    async def test_no_resolution_returns_requested_model_with_none(self):
+        """When all resolution methods fail, return requested_model with None deployment."""
+        router = MagicMock()
+        router.model_list = []
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {}
+
+        response = MagicMock()
+        response.model = "unknown-model"
+
+        data = {
+            "model": "claude-sonnet-4-6",
+            "litellm_params": {},
+        }
+
+        result = callback._resolve_actual_model_with_deployment(
+            data=data,
+            response=response,
+            requested_model="claude-sonnet-4-6",
+        )
+
+        # response.model != requested_model so it returns response.model, None
+        assert result == ("unknown-model", None)
+
+    @pytest.mark.asyncio
+    async def test_no_response_model_uses_deployment_id_fallback(self):
+        """When response has no model attribute, fall through to deployment ID lookup."""
+        router = MagicMock()
+        router.model_list = [
+            {"model_name": "a-minimax-m2.5", "model_info": {"id": "dep-minimax"}},
+        ]
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {}
+
+        # Response without model attribute
+        response = MagicMock(spec=[])
+
+        data = {
+            "model": "claude-sonnet-4-6",
+            "litellm_params": {
+                "model_info": {"id": "dep-minimax"},
+            },
+        }
+
+        result = callback._resolve_actual_model_with_deployment(
+            data=data,
+            response=response,
+            requested_model="claude-sonnet-4-6",
+        )
+
+        assert result == ("a-minimax-m2.5", "dep-minimax")
+
+    @pytest.mark.asyncio
+    async def test_success_hook_logs_via_deployment_id_when_response_model_is_alias(self):
+        """End-to-end test: fallback success with response.model as alias resolves correctly."""
+        router = MagicMock()
+        router.model_list = [
+            {"model_name": "a-glm-4.7", "model_info": {"id": "dep-glm-47"}},
+            {"model_name": "a-minimax-m2.5", "model_info": {"id": "dep-minimax"}},
+        ]
+        router.model_group_alias = {"claude-sonnet-4-6": "a-glm-4.7"}
+
+        callback = RateLimitCallback()
+        callback.set_router(router)
+        callback._model_name_to_litellm_model = {
+            "a-glm-4.7": "zai/glm-4.7",
+            "a-minimax-m2.5": "minimax/MiniMax-M2.5",
+        }
+
+        # Simulate: response.model is the alias (doesn't resolve), but deployment ID is available
+        response = MagicMock()
+        response.model = "claude-sonnet-4-6"
+
+        data = {
+            "model": "claude-sonnet-4-6",
+            "litellm_params": {
+                "model_info": {"id": "dep-minimax"},
+            },
+        }
+
+        with patch("litellm_rate_limit.callback.logger") as mock_logger:
+            await callback.async_post_call_success_hook(
+                data=data,
+                response=response,
+                user_api_key_dict=MagicMock(),
+            )
+
+            info_calls = list(mock_logger.info.call_args_list)
+            success_call = next(
+                (c for c in info_calls if "Successfully called model" in str(c)),
+                None,
+            )
+            assert success_call is not None, "Should have logged success message"
+            # Should log the actual fallback model, not the alias
+            assert "a-minimax-m2.5" in str(success_call), (
+                f"Expected 'a-minimax-m2.5' in log, got: {success_call}"
+            )
+            assert "dep-minimax" in str(success_call), f"Expected 'dep-minimax' in log, got: {success_call}"
+
+
+class TestCooldownCacheAutoRestore:
+    """Tests for issue #0027: Rate limited model cannot be removed from cooldown.
+
+    When a model's rate limit reset time passes, it should be automatically
+    restored to health. Both the health state AND the cooldown_cache entry
+    should be cleared so the model can receive requests again.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cooldown_cache_entry_expires_and_model_can_be_readded(self):
+        """Test that after cooldown entry expires, model is healthy and not re-added."""
+        from unittest.mock import MagicMock, Mock
+
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        # Track cooldown entries with expiration
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-glm-5.1"}},
+        ]
+        # Configure model_group_alias to return the model name itself for this model
+        router.model_group_alias.get.return_value = "glm-5.1"
+        callback.set_router(router)
+
+        # Mark rate limited with short duration
+        await callback._health_state.mark_rate_limited("glm-5.1", 1.0)
+
+        # Pre-call should add to cooldown
+        data = {"model": "glm-5.1"}
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data=data,
+            call_type="completion",
+        )
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1
+        assert "dep-glm-5.1" in _cooldown_entries
+
+        # Wait for rate limit to expire
+        await asyncio.sleep(1.1)
+
+        # Health state should auto-restore
+        is_limited = await callback._health_state.is_rate_limited("glm-5.1")
+        assert is_limited is False, "Health state should auto-restore after rate limit expires"
+
+        # Clear the cooldown_entries to simulate TTL expiration
+        _cooldown_entries.clear()
+
+        # Pre-call should NOT add to cooldown (model is healthy, not rate-limited)
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data={"model": "glm-5.1"},
+            call_type="completion",
+        )
+        # After health state entry expires, model is healthy, NOT re-added to cooldown
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 0, (
+            "Model should remain healthy after rate limit expires - should NOT be re-added to cooldown"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sync_health_state_to_cooldown_respects_expiry(self):
+        """Test that _sync_health_state_to_cooldown doesn't re-add expired models."""
+        from unittest.mock import MagicMock, Mock
+
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "glm-5.1", "model_info": {"id": "dep-glm-5.1"}},
+        ]
+        callback.set_router(router)
+
+        # Mark rate limited with short duration
+        await callback._health_state.mark_rate_limited("glm-5.1", 1.0)
+
+        # Initial sync to cooldown
+        await callback._sync_health_state_to_cooldown("glm-5.1")
+        assert "dep-glm-5.1" in _cooldown_entries
+
+        # Wait for expiry
+        await asyncio.sleep(1.1)
+
+        # Health state should auto-restore
+        is_limited = await callback._health_state.is_rate_limited("glm-5.1")
+        assert is_limited is False
+
+        # Clear the cooldown cache to simulate TTL expiration
+        _cooldown_entries.clear()
+
+        # Try to sync again - should NOT re-add since health state is restored
+        await callback._sync_health_state_to_cooldown("glm-5.1")
+        assert "dep-glm-5.1" not in _cooldown_entries
+
+    @pytest.mark.asyncio
+    async def test_alias_state_auto_restores_after_rate_limit(self):
+        """Test that alias_state auto-restores model after rate limit expires."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        # Mark via alias_state (not health_state)
+        await callback._alias_state.mark_rate_limited("glm-5.1", 1.0)
+
+        # Should be rate limited
+        is_limited = await callback._alias_state.is_rate_limited("glm-5.1")
+        assert is_limited is True
+
+        # Wait for expiry
+        await asyncio.sleep(1.1)
+
+        # Should auto-restore
+        is_limited = await callback._alias_state.is_rate_limited("glm-5.1")
+        assert is_limited is False
