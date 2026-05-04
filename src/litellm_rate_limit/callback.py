@@ -173,7 +173,7 @@ class RateLimitCallback(CustomLogger):
                                 self._health_check_loop = loop
                                 future = loop.create_future()
                                 loop.run_until_complete(
-                                    self._run_initial_checks_and_start_periodic_async(model_names, future)
+                                    self._run_initial_checks_and_start_periodic(model_names, future)
                                 )
                                 # Keep the loop running to support periodic health checks
                                 loop.run_forever()
@@ -209,39 +209,13 @@ class RateLimitCallback(CustomLogger):
                 self._health_checks_started = True
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(self._run_initial_checks_and_start_periodic(model_names))
+                    loop.create_task(self._run_initial_checks_and_start_periodic(model_names, None))
                     logger.info("Scheduled startup health checks for %d models", len(model_names))
                 except RuntimeError:
                     self._startup_models = model_names
                     logger.info("No event loop, deferring startup health checks to first request")
 
-    async def _run_initial_checks_and_start_periodic(self, model_names: list[str]) -> None:
-        if self._health_runner is None:
-            logger.warning("Health runner not initialized, skipping startup health checks")
-            return
-        if not model_names:
-            logger.warning("No models to health check at startup")
-            return
-
-        models_to_check = (
-            self._probe_config.get_models_to_health_check(model_names) if self._probe_config else model_names
-        )
-        logger.info(
-            "Running startup health checks for %d models (reduced from %d via probe config)",
-            len(models_to_check),
-            len(model_names),
-        )
-        client = self._get_health_check_client()
-        await self._health_runner.run_initial_checks_and_start_periodic(
-            models=models_to_check,
-            interval_seconds=self._health_check_interval,
-            health_manager=self._health_state,
-            client=client,
-            cooldown_seconds=self.default_cooldown_seconds,
-        )
-        logger.info("Completed startup health checks for %d models", len(models_to_check))
-
-    async def _run_initial_checks_and_start_periodic_async(
+    async def _run_initial_checks_and_start_periodic(
         self,
         model_names: list[str],
         initial_done_future: asyncio.Future | None = None,
@@ -286,7 +260,7 @@ class RateLimitCallback(CustomLogger):
 
         # Block forever to keep the periodic health checks running
         if self._health_check_loop and self._health_check_loop.is_running():
-            await self._health_check_loop.create_future()
+            await asyncio.Event().wait()
 
     async def async_pre_call_hook(
         self,
@@ -304,7 +278,7 @@ class RateLimitCallback(CustomLogger):
             models = self._startup_models
             self._startup_models = None
             logger.info("Triggering startup health checks for %d models", len(models))
-            await self._run_initial_checks_and_start_periodic(models)
+            await self._run_initial_checks_and_start_periodic(models, None)
 
         rate_limited = await self._health_state.is_rate_limited(model)
 
@@ -586,7 +560,7 @@ class RateLimitCallback(CustomLogger):
                         self._health_checks_started = True
                         try:
                             loop = asyncio.get_running_loop()
-                            loop.create_task(self._run_initial_checks_and_start_periodic(model_names))
+                            loop.create_task(self._run_initial_checks_and_start_periodic(model_names, None))
                             logger.info(
                                 "Auto-started health checks for %d models via _ensure_router",
                                 len(model_names),

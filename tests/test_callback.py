@@ -745,8 +745,11 @@ class TestPeriodicHealthCheckPersistence:
             "Periodic health check task should be running after initial checks complete"
         )
 
-        # Wait for at least one more iteration
-        await asyncio.sleep(0.15)
+        # Wait for at least one more iteration with retry tolerance for slow CI
+        for _ in range(10):
+            await asyncio.sleep(0.05)
+            if call_count >= 2:
+                break
 
         # Should have at least 2 calls (initial + at least one periodic)
         assert call_count >= 2, (
@@ -778,8 +781,11 @@ class TestPeriodicHealthCheckPersistence:
             cooldown_seconds=60.0,
         )
 
-        # Wait for multiple iterations
-        await asyncio.sleep(0.35)
+        # Wait for multiple iterations with retry tolerance for slow CI
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if call_count >= 3:
+                break
 
         # Should have multiple calls
         assert call_count >= 3, (
@@ -810,7 +816,11 @@ class TestPeriodicHealthCheckPersistence:
             cooldown_seconds=60.0,
         )
 
-        await asyncio.sleep(0.35)
+        # Wait for multiple iterations with retry tolerance for slow CI
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if all(c >= 3 for c in calls.values()):
+                break
 
         for model, count in calls.items():
             assert count >= 3, (
