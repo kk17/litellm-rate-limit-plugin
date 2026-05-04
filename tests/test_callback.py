@@ -97,6 +97,7 @@ class TestRateLimitCallback:
     async def test_update_cooldown_with_router(self):
         cooldown_cache = MagicMock()
         cooldown_cache.add_deployment_to_cooldown = Mock()
+        cooldown_cache.get_active_cooldowns = Mock(return_value=[])
         router = Mock()
         router.cooldown_cache = cooldown_cache
         router.model_list = []
@@ -1607,3 +1608,232 @@ class TestCooldownCacheAutoRestore:
         callback = RateLimitCallback()
         # No router set – should not raise
         await callback._remove_from_cooldown_cache("glm-5.1")
+
+
+class TestTaskDestroyedOnCooldownReadd:
+    """Tests for issue #0028: Task destroyed on cooldown readd.
+
+    When a model is already in cooldown and the pre-call hook (or failure hook)
+    tries to add it again, the ``add_deployment_to_cooldown`` call must be
+    skipped to avoid ``Task was destroyed but it is pending!`` errors from
+    LiteLLM's internal LoggingWorker.
+
+    Root cause: ``_update_cooldown`` did not check if a deployment was already
+    in cooldown before calling ``add_deployment_to_cooldown``, unlike
+    ``_sync_health_state_to_cooldown`` which does check.
+    """
+
+    @pytest.mark.asyncio
+    async def test_update_cooldown_skips_already_cooldowned_deployment(self):
+        """_update_cooldown should NOT re-add a deployment already in cooldown.
+
+        This is the core regression test for the "Task was destroyed" bug.
+        Calling ``add_deployment_to_cooldown`` on a deployment that is already
+        in cooldown causes LiteLLM's internal LoggingWorker task to be
+        destroyed without proper cleanup.
+        """
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "gemini-3.1-pro-preview", "model_info": {"id": "dep-5d271880"}},
+        ]
+        callback.set_router(router)
+
+        # First: add the deployment to cooldown
+        await callback._update_cooldown("gemini-3.1-pro-preview", 60.0)
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1
+        assert "dep-5d271880" in _cooldown_entries
+
+        # Second: try to add again — should be skipped since already in cooldown
+        await callback._update_cooldown("gemini-3.1-pro-preview", 60.0)
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1, (
+            "Should NOT call add_deployment_to_cooldown when deployment is already in cooldown"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_cooldown_re_adds_after_cooldown_expires(self):
+        """After cooldown expires, _update_cooldown should be able to add again."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "gemini-pro", "model_info": {"id": "dep-gemini"}},
+        ]
+        callback.set_router(router)
+
+        # Add with short cooldown
+        await callback._update_cooldown("gemini-pro", 0.5)
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1
+
+        # Wait for cooldown to expire
+        await asyncio.sleep(0.6)
+
+        # Should be able to add again
+        await callback._update_cooldown("gemini-pro", 60.0)
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_update_cooldown_with_deployment_id_skips_when_in_cooldown(self):
+        """When request_data contains deployment_id, skip if already in cooldown."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = []
+
+        callback.set_router(router)
+
+        request_data = {
+            "litellm_params": {
+                "model_info": {"id": "dep-5d271880"},
+            },
+        }
+
+        # First call: should add
+        await callback._update_cooldown("gemini-3.1-pro-preview", 60.0, request_data)
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1
+        assert "dep-5d271880" in _cooldown_entries
+
+        # Second call: should skip (already in cooldown)
+        await callback._update_cooldown("gemini-3.1-pro-preview", 60.0, request_data)
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1, (
+            "Should NOT re-add deployment that is already in cooldown"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_cooldown_model_fallback_skips_when_in_cooldown(self):
+        """When no deployment ID is found, model name is used as fallback — should also skip."""
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = []
+        callback.set_router(router)
+
+        # First call: should add using model name as fallback
+        await callback._update_cooldown("unknown-model", 60.0)
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1
+        assert "unknown-model" in _cooldown_entries
+
+        # Second call: should skip (already in cooldown)
+        await callback._update_cooldown("unknown-model", 60.0)
+        assert cooldown_cache.add_deployment_to_cooldown.call_count == 1, (
+            "Should NOT re-add model name fallback that is already in cooldown"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_pre_call_hooks_no_task_destroyed(self):
+        """Simulate concurrent requests for a rate-limited model.
+
+        When multiple requests come in for a model that is already rate-limited,
+        the pre-call hook should handle them gracefully without causing
+        "Task was destroyed" errors.
+        """
+        callback = RateLimitCallback(default_cooldown_seconds=60.0)
+
+        _cooldown_entries: dict[str, float] = {}
+        add_call_count = 0
+
+        def mock_add(model_id, original_exception, exception_status, cooldown_time):
+            nonlocal add_call_count
+            add_call_count += 1
+            _cooldown_entries[model_id] = time.monotonic() + cooldown_time
+
+        def mock_get_active(model_ids, parent_otel_span=None):
+            now = time.monotonic()
+            return [mid for mid in model_ids if mid in _cooldown_entries and now < _cooldown_entries[mid]]
+
+        cooldown_cache = MagicMock()
+        cooldown_cache.add_deployment_to_cooldown = Mock(side_effect=mock_add)
+        cooldown_cache.get_active_cooldowns = Mock(side_effect=mock_get_active)
+
+        router = MagicMock()
+        router.cooldown_cache = cooldown_cache
+        router.model_list = [
+            {"model_name": "gemini-3.1-pro", "model_info": {"id": "dep-gemini"}},
+        ]
+        router.model_group_alias = {}
+        callback.set_router(router)
+
+        # Mark model as rate-limited
+        await callback._health_state.mark_rate_limited("gemini-3.1-pro", 60.0)
+
+        # Simulate multiple concurrent pre-call hooks
+        tasks = []
+        for _ in range(5):
+            tasks.append(
+                callback.async_pre_call_hook(
+                    user_api_key_dict=MagicMock(),
+                    cache=MagicMock(),
+                    data={"model": "gemini-3.1-pro"},
+                    call_type="completion",
+                )
+            )
+
+        results = await asyncio.gather(*tasks)
+
+        # All should return data
+        for r in results:
+            assert r == {"model": "gemini-3.1-pro"}
+
+        # add_deployment_to_cooldown should only be called once (first time)
+        # Subsequent calls should see it's already in cooldown and skip
+        assert add_call_count == 1, (
+            f"Expected exactly 1 add_deployment_to_cooldown call, got {add_call_count}. "
+            "Concurrent requests should not re-add to cooldown."
+        )

@@ -691,6 +691,13 @@ class RateLimitCallback(CustomLogger):
                 deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
 
             if deployment_id:
+                if self._is_deployment_in_cooldown(deployment_id):
+                    logger.info(
+                        "Deployment %s (model %s) already in cooldown, skipping update",
+                        deployment_id,
+                        model,
+                    )
+                    return
                 self._router.cooldown_cache.add_deployment_to_cooldown(
                     model_id=deployment_id,
                     original_exception=Exception("Error detected by rate limit plugin"),
@@ -708,6 +715,13 @@ class RateLimitCallback(CustomLogger):
             deployment_ids = self._get_deployment_ids_for_model(model)
             if deployment_ids:
                 for dep_id in deployment_ids:
+                    if self._is_deployment_in_cooldown(dep_id):
+                        logger.info(
+                            "Deployment %s (model %s) already in cooldown, skipping update",
+                            dep_id,
+                            model,
+                        )
+                        continue
                     self._router.cooldown_cache.add_deployment_to_cooldown(
                         model_id=dep_id,
                         original_exception=Exception("Error detected by rate limit plugin"),
@@ -722,6 +736,12 @@ class RateLimitCallback(CustomLogger):
                     )
                 return
 
+            if self._is_deployment_in_cooldown(model):
+                logger.info(
+                    "Model %s already in cooldown (fallback), skipping update",
+                    model,
+                )
+                return
             logger.warning(
                 "No deployment ID found for model %s, using model name as fallback",
                 model,
