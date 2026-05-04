@@ -56,6 +56,8 @@ class RateLimitCallback(CustomLogger):
 
         self._health_state = HealthStateManager(provider_probe_config=self._probe_config)
         self._alias_state = AliasAwareHealthState()
+        # Wire alias_state back-reference for cross-state synchronization
+        self._health_state._alias_state = self._alias_state
         self._model_name_to_litellm_model: dict[str, str] = {}
 
         self._health_check_enabled = health_check_enabled

@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from litellm_rate_limit.alias_aware_state import AliasAwareHealthState
     from litellm_rate_limit.provider_probe import ProviderProbeConfig
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,9 @@ class HealthStateManager:
     _rate_limited_until: dict[str, float] = field(default_factory=dict)
     _rate_limit_reset_at: dict[str, datetime] = field(default_factory=dict)
     _model_status: dict[str, ModelHealthStatus] = field(default_factory=dict)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _lock: asyncio.Lock = field(default_factory=lambda: asyncio.Lock())
+    # Back-reference to AliasAwareHealthState for cross-state synchronization
+    _alias_state: "AliasAwareHealthState | None" = None
 
     def _get_effective_model(self, model_id: str) -> str:
         if self.provider_probe_config is None:

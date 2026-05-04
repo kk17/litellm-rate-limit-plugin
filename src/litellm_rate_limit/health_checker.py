@@ -180,6 +180,11 @@ class HealthBenchmark:
                             cooldown_seconds,
                         )
 
+                    # Also clear any alias_state entry since health check passed
+                    alias_state = getattr(health_manager, "_alias_state", None)
+                    if alias_state is not None and result.status == HealthStatus.HEALTHY:
+                        await alias_state.clear_rate_limit(result.model_id)
+
                 log_level = logging.INFO if result.status == HealthStatus.HEALTHY else logging.WARNING
                 logger.log(
                     log_level,
@@ -266,6 +271,11 @@ class HealthCheckRunner:
                     healthy_count += 1
                 else:
                     await health_manager.mark_rate_limited(result.model_id, cooldown_seconds)
+
+                # Also clear any alias_state entry since health check passed
+                alias_state = getattr(health_manager, "_alias_state", None)
+                if alias_state is not None and result.status == HealthStatus.HEALTHY:
+                    await alias_state.clear_rate_limit(result.model_id)
 
             log_level = logging.INFO if result.status == HealthStatus.HEALTHY else logging.WARNING
             logger.log(

@@ -346,3 +346,85 @@ class TestPeriodicChecks:
             await task
 
         assert call_count >= 2
+
+
+class TestHealthCheckClearsAliasState:
+    """Test that health checks properly clear alias_state when a model becomes healthy.
+
+    This tests the fix for issue #0023 where health checks pass but stale
+    alias_state entries were not cleared, causing the pre-call hook to use
+    stale unhealthy status.
+    """
+
+    @pytest.mark.asyncio
+    async def test_periodic_check_clears_alias_state_on_healthy(self):
+        from litellm_rate_limit.alias_aware_state import AliasAwareHealthState
+        from litellm_rate_limit.health_state import HealthStateManager
+
+        health_state = HealthStateManager()
+        alias_state = AliasAwareHealthState()
+        # Wire the back-reference
+        health_state._alias_state = alias_state
+
+        benchmark = HealthBenchmark()
+        stop_event = asyncio.Event()
+
+        # Simulate: first call fails (unhealthy), second call succeeds (healthy)
+        call_count = 0
+
+        async def flaky_client(model_id: str, prompt: str):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("Service unavailable")
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        task = asyncio.create_task(
+            benchmark.run_periodic_checks(
+                models=["glm-4.5-air"],
+                interval_seconds=0.05,
+                health_manager=health_state,
+                client=flaky_client,
+                stop_event=stop_event,
+                cooldown_seconds=3600.0,
+            )
+        )
+
+        # Wait for at least 2 health check cycles
+        await asyncio.sleep(0.2)
+        stop_event.set()
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        # After health check passes, alias_state should be cleared
+        is_limited = await alias_state.is_rate_limited("glm-4.5-air")
+        assert is_limited is False, "alias_state should be cleared when health check reports model as healthy"
+
+    @pytest.mark.asyncio
+    async def test_initial_checks_clears_alias_state_on_healthy(self):
+        """Test that initial health checks also clear alias_state."""
+        from litellm_rate_limit.alias_aware_state import AliasAwareHealthState
+        from litellm_rate_limit.health_state import HealthStateManager
+
+        health_state = HealthStateManager()
+        alias_state = AliasAwareHealthState()
+        health_state._alias_state = alias_state
+
+        runner = HealthCheckRunner()
+
+        # Simulate: health check returns healthy
+        async def healthy_client(model_id: str, prompt: str):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        await runner.run_initial_checks_and_start_periodic(
+            models=["glm-4.5-air"],
+            interval_seconds=60,
+            health_manager=health_state,
+            client=healthy_client,
+            cooldown_seconds=3600.0,
+        )
+
+        # alias_state should be cleared
+        is_limited = await alias_state.is_rate_limited("glm-4.5-air")
+        assert is_limited is False
