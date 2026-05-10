@@ -45,6 +45,17 @@ class HeaderParsingConfig:
 
 
 @dataclass
+class FileRotatingConfig:
+    """File rotation configuration nested under rate_limit_plugin.logging.log_file_rotating."""
+
+    handler: str = "none"  # "none", "RotatingFileHandler", "TimedRotatingFileHandler"
+    max_bytes: int = 5 * 1024 * 1024  # 5MB, only for size handler
+    backup_count: int = 3
+    when: str = "midnight"  # only for time handler
+    interval: int = 1  # only for time handler
+
+
+@dataclass
 class LoggingConfig:
     """Logging configuration nested under rate_limit_plugin.logging."""
 
@@ -52,6 +63,12 @@ class LoggingConfig:
     litellm_log_level: str = "INFO"
     litellm_proxy_log_level: str = "INFO"
     litellm_router_log_level: str = "INFO"
+    log_request_header: bool = False
+    log_request_body: bool = False
+    log_file: str = ""
+    error_log_file: str = ""
+    log_file_enabled: bool = False
+    log_file_rotating: FileRotatingConfig = field(default_factory=FileRotatingConfig)
 
 
 @dataclass
@@ -231,6 +248,30 @@ def load_config() -> RateLimitPluginConfig:
                 config.logging.litellm_proxy_log_level = str(lg["litellm_proxy_log_level"])
             if "litellm_router_log_level" in lg:
                 config.logging.litellm_router_log_level = str(lg["litellm_router_log_level"])
+            if "log_request_header" in lg:
+                config.logging.log_request_header = bool(lg["log_request_header"])
+            if "log_request_body" in lg:
+                config.logging.log_request_body = bool(lg["log_request_body"])
+            if "log_file" in lg:
+                config.logging.log_file = str(lg["log_file"])
+            if "error_log_file" in lg:
+                config.logging.error_log_file = str(lg["error_log_file"])
+            if "log_file_enabled" in lg:
+                config.logging.log_file_enabled = bool(lg["log_file_enabled"])
+            if "log_file_rotating" in lg:
+                rot = lg["log_file_rotating"]
+                if isinstance(rot, dict):
+                    rc = config.logging.log_file_rotating
+                    if "handler" in rot:
+                        rc.handler = str(rot["handler"])
+                    if "max_bytes" in rot:
+                        rc.max_bytes = int(rot["max_bytes"])
+                    if "backup_count" in rot:
+                        rc.backup_count = int(rot["backup_count"])
+                    if "when" in rot:
+                        rc.when = str(rot["when"])
+                    if "interval" in rot:
+                        rc.interval = int(rot["interval"])
 
     # Environment variable overrides
     env_cooldown = os.environ.get("RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS")

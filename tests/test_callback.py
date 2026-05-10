@@ -2050,3 +2050,272 @@ class TestTaskDestroyedOnCooldownReadd:
             f"Expected exactly 1 add_deployment_to_cooldown call, got {add_call_count}. "
             "Concurrent requests should not re-add to cooldown."
         )
+
+
+class TestRequestLogging:
+    """Tests for request header/body logging in async_pre_call_hook."""
+
+    @pytest.mark.asyncio
+    async def test_header_logging_enabled(self, capsys):
+        callback = RateLimitCallback(log_level="DEBUG", log_request_header=True)
+        data = {
+            "model": "test-model",
+            "headers": {"Authorization": "Bearer test-key", "Content-Type": "application/json"},
+        }
+
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data=data,
+            call_type="completion",
+        )
+
+        captured = capsys.readouterr()
+        assert "Request headers" in captured.err
+        assert "test-model" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_body_logging_enabled_for_completion(self, capsys):
+        callback = RateLimitCallback(log_level="DEBUG", log_request_body=True)
+        data = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data=data,
+            call_type="completion",
+        )
+
+        captured = capsys.readouterr()
+        assert "Request body" in captured.err
+        assert "test-model" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_body_logging_works_for_all_call_types(self, capsys):
+        callback = RateLimitCallback(log_level="DEBUG", log_request_body=True)
+        data = {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}
+
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data=data,
+            call_type="embedding",
+        )
+
+        captured = capsys.readouterr()
+        # Body should be logged for all call types
+        assert "Request body" in captured.err
+        assert "call_type=embedding" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_body_logging_excludes_proxy_server_request(self, capsys):
+        callback = RateLimitCallback(log_level="DEBUG", log_request_body=True)
+        data = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "proxy_server_request": {
+                "url": "http://localhost/v1/responses",
+                "headers": {"host": "localhost"},
+            },
+        }
+
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data=data,
+            call_type="arequest",
+        )
+
+        captured = capsys.readouterr()
+        assert "Request body" in captured.err
+        # proxy_server_request should be excluded from the logged body
+        assert "proxy_server_request" not in captured.err
+
+    @pytest.mark.asyncio
+    async def test_header_logging_from_proxy_server_request(self, capsys):
+        """Headers for /v1/responses are in proxy_server_request, not data["headers"]."""
+        callback = RateLimitCallback(log_level="DEBUG", log_request_header=True)
+        data = {
+            "model": "test-model",
+            "proxy_server_request": {
+                "url": "http://localhost:4000/v1/responses",
+                "method": "POST",
+                "headers": {"host": "localhost:4000", "content-type": "application/json"},
+            },
+        }
+
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data=data,
+            call_type="arequest",
+        )
+
+        captured = capsys.readouterr()
+        assert "Request headers" in captured.err
+        assert "localhost:4000" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_no_logging_when_disabled(self, capsys):
+        callback = RateLimitCallback(log_level="DEBUG")
+        data = {
+            "model": "test-model",
+            "headers": {"Authorization": "Bearer test-key"},
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data=data,
+            call_type="completion",
+        )
+
+        captured = capsys.readouterr()
+        assert "Request headers" not in captured.err
+        assert "Request body" not in captured.err
+
+
+class TestFileLogging:
+    """Tests for file-based logging handler setup."""
+
+    def test_no_file_handlers_when_disabled(self):
+        _callback = RateLimitCallback(log_file_enabled=False)
+        callback_logger = __import__("logging").getLogger("litellm_rate_limit.callback")
+        # Should only have the StreamHandler
+        file_handlers = [
+            h for h in callback_logger.handlers if isinstance(h, __import__("logging").FileHandler)
+        ]
+        assert len(file_handlers) == 0
+
+    def test_file_handler_created_when_enabled(self, tmp_path):
+        from litellm_rate_limit.config import FileRotatingConfig
+
+        log_file = str(tmp_path / "test.log")
+        _callback = RateLimitCallback(
+            log_file_enabled=True,
+            log_file=log_file,
+            log_file_rotating=FileRotatingConfig(handler="none"),
+        )
+
+        import logging
+
+        callback_logger = logging.getLogger("litellm_rate_limit.callback")
+        file_handlers = [h for h in callback_logger.handlers if isinstance(h, logging.FileHandler)]
+        assert len(file_handlers) >= 1
+
+        # Cleanup
+        for h in file_handlers:
+            h.close()
+            callback_logger.removeHandler(h)
+
+    def test_size_rotation_handler(self, tmp_path):
+        import logging
+        import logging.handlers
+
+        from litellm_rate_limit.config import FileRotatingConfig
+
+        log_file = str(tmp_path / "test.log")
+        _callback = RateLimitCallback(
+            log_file_enabled=True,
+            log_file=log_file,
+            log_file_rotating=FileRotatingConfig(
+                handler="RotatingFileHandler", max_bytes=1024, backup_count=2
+            ),
+        )
+
+        callback_logger = logging.getLogger("litellm_rate_limit.callback")
+        rotating_handlers = [
+            h for h in callback_logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)
+        ]
+        assert len(rotating_handlers) >= 1
+        assert rotating_handlers[0].maxBytes == 1024
+        assert rotating_handlers[0].backupCount == 2
+
+        # Cleanup
+        for h in rotating_handlers:
+            h.close()
+            callback_logger.removeHandler(h)
+
+    def test_time_rotation_handler(self, tmp_path):
+        import logging
+        import logging.handlers
+
+        from litellm_rate_limit.config import FileRotatingConfig
+
+        log_file = str(tmp_path / "test.log")
+        _callback = RateLimitCallback(
+            log_file_enabled=True,
+            log_file=log_file,
+            log_file_rotating=FileRotatingConfig(handler="TimedRotatingFileHandler", when="H", interval=6),
+        )
+
+        callback_logger = logging.getLogger("litellm_rate_limit.callback")
+        timed_handlers = [
+            h for h in callback_logger.handlers if isinstance(h, logging.handlers.TimedRotatingFileHandler)
+        ]
+        assert len(timed_handlers) >= 1
+
+        # Cleanup
+        for h in timed_handlers:
+            h.close()
+            callback_logger.removeHandler(h)
+
+    def test_error_log_handler_level(self, tmp_path):
+        import logging
+
+        from litellm_rate_limit.config import FileRotatingConfig
+
+        log_file = str(tmp_path / "test.log")
+        error_file = str(tmp_path / "error.log")
+        _callback = RateLimitCallback(
+            log_file_enabled=True,
+            log_file=log_file,
+            error_log_file=error_file,
+            log_file_rotating=FileRotatingConfig(handler="none"),
+        )
+
+        callback_logger = logging.getLogger("litellm_rate_limit.callback")
+        error_handlers = [
+            h
+            for h in callback_logger.handlers
+            if isinstance(h, logging.FileHandler) and h.level == logging.ERROR
+        ]
+        assert len(error_handlers) >= 1
+
+        # Cleanup
+        for h in error_handlers:
+            h.close()
+            callback_logger.removeHandler(h)
+
+    def test_graceful_fallback_on_bad_path(self):
+        """File handler setup should not crash on unwritable paths."""
+        _callback = RateLimitCallback(
+            log_file_enabled=True,
+            log_file="/nonexistent_root_dir/impossible/test.log",
+        )
+        # Should not raise — graceful fallback to console-only
+
+    def test_auto_create_parent_directory(self, tmp_path):
+        import logging
+
+        from litellm_rate_limit.config import FileRotatingConfig
+
+        log_file = str(tmp_path / "subdir" / "nested" / "test.log")
+        _callback = RateLimitCallback(
+            log_file_enabled=True,
+            log_file=log_file,
+            log_file_rotating=FileRotatingConfig(handler="none"),
+        )
+
+        assert (tmp_path / "subdir" / "nested").is_dir()
+
+        # Cleanup
+        callback_logger = logging.getLogger("litellm_rate_limit.callback")
+        for h in list(callback_logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                h.close()
+                callback_logger.removeHandler(h)

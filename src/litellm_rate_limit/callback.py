@@ -2,9 +2,11 @@
 
 import asyncio
 import logging
+import logging.handlers
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from litellm.integrations.custom_logger import CustomLogger
@@ -12,7 +14,7 @@ from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.utils import DualCache
 
 from litellm_rate_limit.alias_aware_state import AliasAwareHealthState
-from litellm_rate_limit.config import RateLimitPluginConfig
+from litellm_rate_limit.config import FileRotatingConfig, RateLimitPluginConfig
 from litellm_rate_limit.health_checker import HealthBenchmark, HealthCheckRunner
 from litellm_rate_limit.health_state import HealthStateManager
 from litellm_rate_limit.parser import detect_api_error, extract_rate_limit_reset_seconds, is_rate_limit_error
@@ -45,6 +47,12 @@ class RateLimitCallback(CustomLogger):
         litellm_log_level: str = "INFO",
         litellm_proxy_log_level: str = "INFO",
         litellm_router_log_level: str = "INFO",
+        log_request_header: bool = False,
+        log_request_body: bool = False,
+        log_file: str = "",
+        error_log_file: str = "",
+        log_file_enabled: bool = False,
+        log_file_rotating: FileRotatingConfig | None = None,
     ):
         self.default_cooldown_seconds = default_cooldown_seconds
         self._router: LiteLLMRouter | None = None
@@ -67,6 +75,9 @@ class RateLimitCallback(CustomLogger):
         self._startup_models: list[str] | None = None
         self._startup_thread: threading.Thread | None = None
         self._health_check_loop: asyncio.AbstractEventLoop | None = None
+
+        self._log_request_header = log_request_header
+        self._log_request_body = log_request_body
 
         health_logger = logging.getLogger("litellm_rate_limit.health_checker")
         provider_logger = logging.getLogger("litellm_rate_limit.provider_probe")
@@ -97,6 +108,16 @@ class RateLimitCallback(CustomLogger):
             lg.propagate = False
             lg.addHandler(handler)
             lg.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+        # File handlers
+        if log_file_enabled:
+            rotating_config = log_file_rotating or FileRotatingConfig()
+            self._setup_file_handlers(
+                plugin_loggers=plugin_loggers,
+                log_file=log_file,
+                error_log_file=error_log_file,
+                rotating_config=rotating_config,
+            )
 
         litellm_main_logger = logging.getLogger("LiteLLM")
         litellm_main_logger.setLevel(getattr(logging, litellm_log_level.upper(), logging.INFO))
@@ -143,7 +164,68 @@ class RateLimitCallback(CustomLogger):
             litellm_log_level=config.logging.litellm_log_level,
             litellm_proxy_log_level=config.logging.litellm_proxy_log_level,
             litellm_router_log_level=config.logging.litellm_router_log_level,
+            log_request_header=config.logging.log_request_header,
+            log_request_body=config.logging.log_request_body,
+            log_file=config.logging.log_file,
+            error_log_file=config.logging.error_log_file,
+            log_file_enabled=config.logging.log_file_enabled,
+            log_file_rotating=config.logging.log_file_rotating,
         )
+
+    def _setup_file_handlers(
+        self,
+        plugin_loggers: list[logging.Logger],
+        log_file: str,
+        error_log_file: str,
+        rotating_config: FileRotatingConfig,
+    ) -> None:
+        """Configure file-based logging handlers for plugin loggers."""
+        file_format = "%(asctime)s - %(name)s:%(levelname)s: %(filename)s:%(lineno)s - %(message)s"
+        file_formatter = logging.Formatter(file_format, datefmt="%Y-%m-%d %H:%M:%S")
+
+        def _create_handler(file_path: str, level: int = logging.NOTSET) -> logging.Handler | None:
+            """Create a file handler with rotation support. Returns None on failure."""
+            try:
+                path = Path(file_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+
+                if rotating_config.handler == "RotatingFileHandler":
+                    fh: logging.Handler = logging.handlers.RotatingFileHandler(
+                        filename=str(path),
+                        maxBytes=rotating_config.max_bytes,
+                        backupCount=rotating_config.backup_count,
+                    )
+                elif rotating_config.handler == "TimedRotatingFileHandler":
+                    fh = logging.handlers.TimedRotatingFileHandler(
+                        filename=str(path),
+                        when=rotating_config.when,
+                        interval=rotating_config.interval,
+                        backupCount=rotating_config.backup_count,
+                    )
+                else:
+                    fh = logging.FileHandler(str(path))
+
+                fh.setFormatter(file_formatter)
+                if level != logging.NOTSET:
+                    fh.setLevel(level)
+                return fh
+            except OSError as e:
+                logger.warning("Failed to create file handler for %s: %s", file_path, e)
+                return None
+
+        if log_file:
+            handler = _create_handler(log_file)
+            if handler:
+                for lg in plugin_loggers:
+                    lg.addHandler(handler)
+                logger.info("File logging enabled: %s (rotation=%s)", log_file, rotating_config.handler)
+
+        if error_log_file:
+            error_handler = _create_handler(error_log_file, level=logging.ERROR)
+            if error_handler:
+                for lg in plugin_loggers:
+                    lg.addHandler(error_handler)
+                logger.info("Error file logging enabled: %s", error_log_file)
 
     def _start_router_poll_thread(self) -> None:
         def poll_for_router():
@@ -278,6 +360,24 @@ class RateLimitCallback(CustomLogger):
             logger.info("Pre-call hook for model %s (alias for: %s)", original_model, resolved_target)
         else:
             logger.info("Pre-call hook for model %s", original_model)
+
+        # Optional request detail logging
+        if self._log_request_header:
+            # Headers may be in data["headers"], data["metadata"]["headers"],
+            # or data["proxy_server_request"]["headers"] (e.g. /v1/responses)
+            headers = data.get("headers") or {}
+            if not headers:
+                headers = (data.get("metadata") or {}).get("headers", {})
+            if not headers:
+                psr = data.get("proxy_server_request")
+                if isinstance(psr, dict):
+                    headers = psr.get("headers", {})
+            logger.debug("Request headers for model %s: %s", original_model, headers)
+        if self._log_request_body:
+            # Exclude internal fields from the logged body
+            _exclude_keys = {"headers", "metadata", "proxy_server_request"}
+            body = {k: v for k, v in data.items() if k not in _exclude_keys}
+            logger.debug("Request body for model %s (call_type=%s): %s", original_model, call_type, body)
 
         if self._startup_models:
             models = self._startup_models

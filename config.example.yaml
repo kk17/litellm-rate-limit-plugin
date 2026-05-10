@@ -58,6 +58,22 @@ rate_limit_plugin:
   logging:
     log_level: DEBUG
     router_log_level: CRITICAL
+    # Log request headers in pre-call hook (default: false)
+    # log_request_header: true
+    # Log request body in pre-call hook for POST/PUT calls (default: false)
+    # log_request_body: true
+    # File logging (default: disabled)
+    # log_file_enabled: true
+    # log_file: ./logs/litellm.log
+    # error_log_file: ./logs/litellm-error.log
+    # log_file_rotating:
+    #   handler: none  # none (default), RotatingFileHandler, TimedRotatingFileHandler
+    #   # Size-based rotation (handler: RotatingFileHandler)
+    #   # max_bytes: 5242880  # 5MB
+    #   # backup_count: 3
+    #   # Time-based rotation (handler: TimedRotatingFileHandler)
+    #   # when: midnight
+    #   # interval: 1
 
   # Header parsing configuration
   header_parsing:

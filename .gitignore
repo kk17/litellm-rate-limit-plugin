@@ -11,3 +11,4 @@ htmlcov/
 config.yaml
 test.sh
 *.env
+logs
