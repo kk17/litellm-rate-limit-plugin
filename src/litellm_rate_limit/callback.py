@@ -385,17 +385,26 @@ class RateLimitCallback(CustomLogger):
             logger.info("Triggering startup health checks for %d models", len(models))
             await self._run_initial_checks_and_start_periodic(models, None)
 
-        rate_limited = await self._health_state.is_rate_limited(original_model)
-
-        if not rate_limited:
-            rate_limited = await self._alias_state.is_rate_limited(original_model)
+        health_rate_limited = await self._health_state.is_rate_limited(original_model)
+        alias_rate_limited = False
+        if not health_rate_limited:
+            alias_rate_limited = await self._alias_state.is_rate_limited(original_model)
+        rate_limited = health_rate_limited or alias_rate_limited
 
         if rate_limited:
             resolved_target = self._alias_state._resolve_to_target(original_model)
+            health_remaining = self._health_state.get_remaining_cooldown(original_model)
+            alias_remaining = self._alias_state.get_remaining_cooldown(original_model)
             logger.info(
-                "Model %s is rate-limited (resolved to %s), adding to cooldown cache",
+                "Model %s is rate-limited (resolved to %s). "
+                "Source: health_state=%s, alias_state=%s. "
+                "Remaining cooldown: health=%s, alias=%s",
                 original_model,
                 resolved_target,
+                health_rate_limited,
+                alias_rate_limited,
+                f"{health_remaining:.1f}s" if health_remaining is not None else "none",
+                f"{alias_remaining:.1f}s" if alias_remaining is not None else "none",
             )
             await self._sync_health_state_to_cooldown(resolved_target, data)
         else:
@@ -878,12 +887,28 @@ class RateLimitCallback(CustomLogger):
             return
 
         remaining = self._health_state.get_remaining_cooldown(model)
+        logger.debug(
+            "Sync cooldown for %s: health_state remaining=%s",
+            model,
+            f"{remaining:.1f}s" if remaining is not None else "none",
+        )
         if remaining is None or remaining <= 0:
             remaining = self._alias_state.get_remaining_cooldown(model)
+            logger.debug(
+                "Sync cooldown for %s: alias_state remaining=%s",
+                model,
+                f"{remaining:.1f}s" if remaining is not None else "none",
+            )
         if remaining is None or remaining <= 0:
+            logger.debug("No remaining cooldown for model %s, skipping sync", model)
             return
 
         cooldown_seconds = remaining
+        logger.info(
+            "Syncing cooldown for model %s: %.1fs remaining",
+            model,
+            cooldown_seconds,
+        )
 
         async with self._cooldown_cache_lock:
             deployment_ids = self._get_deployment_ids_for_model(model)
@@ -933,6 +958,12 @@ class RateLimitCallback(CustomLogger):
             model_ids=[deployment_id],
             parent_otel_span=None,
         )
+        if active:
+            logger.debug(
+                "Deployment %s is in cooldown in LiteLLM cache: %s",
+                deployment_id,
+                active,
+            )
         return bool(active)
 
     async def _remove_from_cooldown_cache(self, model: str) -> None:
@@ -953,6 +984,11 @@ class RateLimitCallback(CustomLogger):
         targets = deployment_ids if deployment_ids else [resolved_model]
         for target_id in targets:
             if not self._is_deployment_in_cooldown(target_id):
+                logger.debug(
+                    "Deployment %s (model %s) not in cooldown cache, no cleanup needed",
+                    target_id,
+                    resolved_model,
+                )
                 continue
 
             removed_method = getattr(self._router.cooldown_cache, "remove_deployment_from_cooldown", None)
@@ -972,7 +1008,7 @@ class RateLimitCallback(CustomLogger):
                     exception_status=429,
                     cooldown_time=0.01,
                 )
-                logger.info(
+                logger.debug(
                     "Overwrote stale cooldown cache entry for %s (model %s) with near-zero TTL",
                     target_id,
                     resolved_model,
