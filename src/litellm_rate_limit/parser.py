@@ -15,6 +15,17 @@ from typing import Any
 
 DEFAULT_COOLDOWN_SECONDS = 60.0
 
+# Cache local timezone to avoid repeated system calls
+_local_timezone = None
+
+
+def _get_local_timezone() -> timezone:
+    """Get the local system timezone."""
+    global _local_timezone
+    if _local_timezone is None:
+        _local_timezone = datetime.now().astimezone().tzinfo
+    return _local_timezone
+
 
 def detect_api_error(result: Any) -> tuple[bool, int, str] | None:
     if result is None:
@@ -198,13 +209,13 @@ def _extract_reset_time_from_message(error: Exception) -> datetime | None:
             with contextlib.suppress(BaseException):
                 dt = datetime.fromisoformat(date_str.replace(" ", "T"))
                 if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
+                    dt = dt.replace(tzinfo=_get_local_timezone())
                 return dt
             # Try RFC 2822 format
             with contextlib.suppress(BaseException):
                 dt = parsedate_to_datetime(date_str)
                 if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
+                    dt = dt.replace(tzinfo=_get_local_timezone())
                 return dt
 
     return None
@@ -329,7 +340,7 @@ def extract_rate_limit_reset_seconds(error: Exception, default: float = DEFAULT_
     if reset_dt is None:
         return default
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(_get_local_timezone())
     delta = reset_dt - now
     seconds = delta.total_seconds()
 

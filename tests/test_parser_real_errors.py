@@ -1,6 +1,6 @@
 """Test parsing reset time from error messages with realistic error objects."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from unittest.mock import Mock
 
 import pytest
@@ -10,7 +10,8 @@ from litellm_rate_limit.parser import extract_rate_limit_reset_seconds
 
 def make_future_message(hours_ahead: int = 24) -> str:
     """Generate an error message with a future datetime."""
-    future_dt = datetime.now(timezone.utc) + timedelta(hours=hours_ahead)
+    local_tz = datetime.now().astimezone().tzinfo
+    future_dt = datetime.now(local_tz) + timedelta(hours=hours_ahead)
     return f"Usage limit reached. Your limit will reset at {future_dt.strftime('%Y-%m-%d %H:%M:%S')}"
 
 
@@ -23,7 +24,6 @@ class TestExtractRateLimitResetSecondsWithRealErrors:
 
         seconds = extract_rate_limit_reset_seconds(error, default=3600)
 
-        # Should parse the reset time (around 2 hours), not use default (3600)
         assert seconds != 3600
         assert 7000 < seconds < 7500
 
@@ -36,7 +36,6 @@ class TestExtractRateLimitResetSecondsWithRealErrors:
 
         seconds = extract_rate_limit_reset_seconds(error, default=3600)
 
-        # Should parse the reset time (around 2 hours), not use default (3600)
         assert seconds != 3600
         assert 7000 < seconds < 7500
 
@@ -45,7 +44,6 @@ class TestExtractRateLimitResetSecondsWithRealErrors:
         error = Mock()
         error.message = make_future_message(hours_ahead=1)
 
-        # This should not raise TypeError: can't subtract offset-naive and offset-aware datetimes
         try:
             seconds = extract_rate_limit_reset_seconds(error, default=3600)
             assert seconds > 0
