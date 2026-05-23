@@ -99,6 +99,7 @@ class RateLimitPluginConfig:
     """
 
     default_cooldown_seconds: float = 60.0
+    filter_unsupported_tool_types: bool = False
     health_check: HealthCheckConfig = field(default_factory=HealthCheckConfig)
     header_parsing: HeaderParsingConfig = field(default_factory=HeaderParsingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
@@ -210,6 +211,9 @@ def load_config() -> RateLimitPluginConfig:
     # Top-level keys
     if "default_cooldown_seconds" in yaml_config:
         config.default_cooldown_seconds = float(yaml_config["default_cooldown_seconds"])
+
+    if "filter_unsupported_tool_types" in yaml_config:
+        config.filter_unsupported_tool_types = bool(yaml_config["filter_unsupported_tool_types"])
 
     # Header parsing (nested under header_parsing)
     if "header_parsing" in yaml_config:

@@ -54,6 +54,7 @@ class RateLimitCallback(CustomLogger):
         error_log_file: str = "",
         log_file_enabled: bool = False,
         log_file_rotating: FileRotatingConfig | None = None,
+        filter_unsupported_tool_types: bool = False,
     ):
         self.default_cooldown_seconds = default_cooldown_seconds
         self._router: LiteLLMRouter | None = None
@@ -79,6 +80,7 @@ class RateLimitCallback(CustomLogger):
 
         self._log_request_header = log_request_header
         self._log_request_body = log_request_body
+        self._filter_unsupported_tool_types = filter_unsupported_tool_types
 
         health_logger = logging.getLogger("litellm_rate_limit.health_checker")
         provider_logger = logging.getLogger("litellm_rate_limit.provider_probe")
@@ -171,6 +173,7 @@ class RateLimitCallback(CustomLogger):
             error_log_file=config.logging.error_log_file,
             log_file_enabled=config.logging.log_file_enabled,
             log_file_rotating=config.logging.log_file_rotating,
+            filter_unsupported_tool_types=config.filter_unsupported_tool_types,
         )
 
     def _setup_file_handlers(
@@ -426,6 +429,68 @@ class RateLimitCallback(CustomLogger):
             # (left over from a previous rate-limit period) are removed so
             # LiteLLM Router can route requests to this model again.
             await self._remove_from_cooldown_cache(original_model)
+
+        # Filter unsupported tool types before Responses→Chat Completions bridge
+        if self._filter_unsupported_tool_types:
+            data = self._filter_tools(data)
+
+        return data
+
+    def _filter_tools(self, data: dict) -> dict:
+        """Filter out tools with types not supported by chat completions API.
+
+        This prevents the Responses→Chat Completions bridge from forwarding
+        unsupported tool types (e.g. 'namespace', 'local_shell') to providers
+        that only accept 'function' or 'mcp' types.
+
+        See: https://github.com/BerriAI/litellm/issues/27655
+        """
+        tools = data.get("tools")
+        if not tools:
+            return data
+
+        # Valid chat completion tool types
+        valid_types = {"function", "mcp"}
+
+        filtered = [t for t in tools if t.get("type") in valid_types]
+        if len(filtered) != len(tools):
+            dropped = [t.get("type") for t in tools if t.get("type") not in valid_types]
+            logger.info(
+                "[FilterUnsupportedToolTypes] Dropped %d tool(s) with unsupported types: %s",
+                len(tools) - len(filtered),
+                dropped,
+            )
+            data = dict(data)
+            data["tools"] = filtered
+
+        return data
+
+    def _filter_tools(self, data: dict) -> dict:
+        """Filter out tools with types not supported by chat completions API.
+
+        This prevents the Responses→Chat Completions bridge from forwarding
+        unsupported tool types (e.g. 'namespace', 'local_shell') to providers
+        that only accept 'function' or 'mcp' types.
+
+        See: https://github.com/BerriAI/litellm/issues/27655
+        """
+        tools = data.get("tools")
+        if not tools:
+            return data
+
+        # Valid chat completion tool types
+        valid_types = {"function", "mcp"}
+
+        filtered = [t for t in tools if t.get("type") in valid_types]
+        if len(filtered) != len(tools):
+            dropped = [t.get("type") for t in tools if t.get("type") not in valid_types]
+            logger.info(
+                "[FilterUnsupportedToolTypes] Dropped %d tool(s) with unsupported types: %s",
+                len(tools) - len(filtered),
+                dropped,
+            )
+            data = dict(data)
+            data["tools"] = filtered
 
         return data
 

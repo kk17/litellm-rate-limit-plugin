@@ -2319,3 +2319,213 @@ class TestFileLogging:
             if isinstance(h, logging.FileHandler):
                 h.close()
                 callback_logger.removeHandler(h)
+
+
+class TestFilterUnsupportedToolTypes:
+    """Tests for issue #0029: Responses API bridge passes through unsupported tool types.
+
+    When LiteLLM converts a Responses API request to Chat Completions API, tool types
+    that are not valid in chat completions (e.g., 'namespace', 'local_shell') are
+    forwarded verbatim, causing provider-side 400 errors.
+
+    The pre-call hook should filter out tools with unsupported types before the bridge runs.
+    See: https://github.com/BerriAI/litellm/issues/27655
+    """
+
+    @pytest.mark.asyncio
+    async def test_filter_tools_drops_namespace_type(self):
+        """Tools with type='namespace' should be filtered out."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=True)
+        data = {
+            "model": "glm-5.1",
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather"}},
+                {"type": "namespace", "name": "my_tools", "tools": []},
+            ],
+        }
+
+        result = callback._filter_tools(data)
+
+        # namespace tool should be dropped
+        assert len(result["tools"]) == 1
+        assert result["tools"][0]["type"] == "function"
+
+    @pytest.mark.asyncio
+    async def test_filter_tools_preserves_function_and_mcp_types(self):
+        """Tools with type='function' or 'mcp' should be preserved."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=True)
+        data = {
+            "model": "glm-5.1",
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather"}},
+                {"type": "mcp", "name": "mcp_server", "description": "MCP server"},
+            ],
+        }
+
+        result = callback._filter_tools(data)
+
+        # Both should be preserved
+        assert len(result["tools"]) == 2
+        types = {t["type"] for t in result["tools"]}
+        assert types == {"function", "mcp"}
+
+    @pytest.mark.asyncio
+    async def test_filter_tools_no_op_when_disabled(self):
+        """When filter_unsupported_tool_types=False, no filtering occurs."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=False)
+        data = {
+            "model": "glm-5.1",
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather"}},
+                {"type": "namespace", "name": "my_tools"},
+            ],
+        }
+
+        result = callback._filter_tools(data)
+
+        # Both tools should remain (no filtering)
+        assert len(result["tools"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_filter_tools_no_op_when_no_tools(self):
+        """When there are no tools, no filtering should occur."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=True)
+        data = {"model": "glm-5.1", "messages": [{"role": "user", "content": "hello"}]}
+
+        result = callback._filter_tools(data)
+
+        # Should return unchanged
+        assert "tools" not in result
+
+    @pytest.mark.asyncio
+    async def test_filter_tools_drops_multiple_unsupported_types(self):
+        """Multiple unsupported tool types should all be dropped."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=True)
+        data = {
+            "model": "glm-5.1",
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather"}},
+                {"type": "namespace", "name": "ns1"},
+                {"type": "local_shell", "name": "shell"},
+                {"type": "file_search", "name": "file_search"},
+                {"type": "web_search", "name": "web_search"},
+            ],
+        }
+
+        result = callback._filter_tools(data)
+
+        # Only function tool should remain
+        assert len(result["tools"]) == 1
+        assert result["tools"][0]["type"] == "function"
+
+    @pytest.mark.asyncio
+    async def test_filter_tools_preserves_function_with_all_fields(self):
+        """Function tools should preserve all their fields."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=True)
+        data = {
+            "model": "glm-5.1",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                        "strict": True,
+                    },
+                },
+                {"type": "namespace", "name": "my_tools"},
+            ],
+        }
+
+        result = callback._filter_tools(data)
+
+        # Function tool should have all fields preserved
+        assert len(result["tools"]) == 1
+        func_tool = result["tools"][0]["function"]
+        assert func_tool["name"] == "get_weather"
+        assert func_tool["strict"] is True
+        assert "required" in func_tool["parameters"]
+
+    @pytest.mark.asyncio
+    async def test_pre_call_hook_applies_filter_when_enabled(self):
+        """Pre-call hook should apply tool filtering when enabled."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=True)
+        data = {
+            "model": "glm-5.1",
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather"}},
+                {"type": "namespace", "name": "my_tools"},
+            ],
+        }
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data=data,
+            call_type="completion",
+        )
+
+        # namespace tool should be filtered
+        assert len(result["tools"]) == 1
+        assert result["tools"][0]["type"] == "function"
+
+    @pytest.mark.asyncio
+    async def test_pre_call_hook_no_filter_when_disabled(self):
+        """Pre-call hook should NOT filter when feature is disabled."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=False)
+        data = {
+            "model": "glm-5.1",
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather"}},
+                {"type": "namespace", "name": "my_tools"},
+            ],
+        }
+
+        result = await callback.async_pre_call_hook(
+            user_api_key_dict=MagicMock(),
+            cache=MagicMock(),
+            data=data,
+            call_type="completion",
+        )
+
+        # Both tools should remain
+        assert len(result["tools"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_filter_tools_handles_empty_tools_list(self):
+        """Empty tools list should be handled gracefully."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=True)
+        data = {"model": "glm-5.1", "tools": []}
+
+        result = callback._filter_tools(data)
+
+        # Should not crash, tools remains empty
+        assert result["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_filter_tools_preserves_non_tools_fields(self):
+        """Filtering should not affect other fields in the data dict."""
+        callback = RateLimitCallback(filter_unsupported_tool_types=True)
+        data = {
+            "model": "glm-5.1",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.7,
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather"}},
+                {"type": "namespace", "name": "my_tools"},
+            ],
+        }
+
+        result = callback._filter_tools(data)
+
+        # Other fields should be preserved
+        assert result["model"] == "glm-5.1"
+        assert result["messages"] == data["messages"]
+        assert result["temperature"] == 0.7
+        # Only tools should be modified
+        assert len(result["tools"]) == 1
