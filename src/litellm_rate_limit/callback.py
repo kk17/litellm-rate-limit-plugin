@@ -484,7 +484,7 @@ class RateLimitCallback(CustomLogger):
         filtered = [t for t in tools if t.get("type") in valid_types]
         if len(filtered) != len(tools):
             dropped = [t.get("type") for t in tools if t.get("type") not in valid_types]
-            logger.info(
+            logger.debug(
                 "[FilterUnsupportedToolTypes] Dropped %d tool(s) with unsupported types: %s",
                 len(tools) - len(filtered),
                 dropped,
