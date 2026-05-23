@@ -5,7 +5,7 @@ description = "Intelligent health checking and rate limit handling plugin for Li
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "litellm[proxy]>=1.50.0",
+    "litellm[proxy]>=1.85.1",
 ]
 
 [project.optional-dependencies]

@@ -1,6 +1,7 @@
 """Custom callback for LiteLLM to handle rate limits and unhealthy models."""
 
 import asyncio
+import json
 import logging
 import logging.handlers
 import threading
@@ -372,12 +373,25 @@ class RateLimitCallback(CustomLogger):
                 psr = data.get("proxy_server_request")
                 if isinstance(psr, dict):
                     headers = psr.get("headers", {})
-            logger.debug("Request headers for model %s: %s", original_model, headers)
+            try:
+                logger.debug("Request headers for model %s: %s", original_model, json.dumps(headers))
+            except (TypeError, ValueError):
+                logger.debug("Request headers for model %s: %s", original_model, repr(headers))
         if self._log_request_body:
             # Exclude internal fields from the logged body
             _exclude_keys = {"headers", "metadata", "proxy_server_request"}
             body = {k: v for k, v in data.items() if k not in _exclude_keys}
-            logger.debug("Request body for model %s (call_type=%s): %s", original_model, call_type, body)
+            try:
+                logger.debug(
+                    "Request body for model %s (call_type=%s): %s",
+                    original_model,
+                    call_type,
+                    json.dumps(body),
+                )
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Request body for model %s (call_type=%s): %s", original_model, call_type, repr(body)
+                )
 
         if self._startup_models:
             models = self._startup_models
